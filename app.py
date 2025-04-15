@@ -3,12 +3,15 @@ import numpy as np
 import pandas as pd
 import json
 import os
-import ccxt
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 import sqlite3
 import time
+import eth_account
+from eth_account.signers.local import LocalAccount
+from hyperliquid.info import Info
+from hyperliquid.utils import constants
 
 # Set page config
 st.set_page_config(
@@ -26,6 +29,21 @@ BASE_VOL = 0.35
 VOL_MULTIPLIER = 1.5
 MIN_LIQUIDITY = 50000  # Lower default to 50k
 FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
+
+# Initialize Hyperliquid Info client
+@st.cache_resource
+def init_hyperliquid():
+    return Info(constants.MAINNET_API_URL, skip_ws=True)
+
+info = init_hyperliquid()
+
+# Initialize session state if not already present
+if 'signals' not in st.session_state:
+    st.session_state.signals = []
+if 'scanned_markets' not in st.session_state:
+    st.session_state.scanned_markets = pd.DataFrame()
+if 'debug_info' not in st.session_state:
+    st.session_state.debug_info = {}
 
 # Rate limiter class
 class RateLimiter:
@@ -64,25 +82,6 @@ def api_request_with_retry(func, *args, max_retries=3, **kwargs):
     
     # This should never be reached due to the exception in the loop
     return None
-
-# Initialize CCXT exchange instance
-@st.cache_resource
-def init_exchange():
-    return ccxt.hyperliquid({
-        'enableRateLimit': True,  # Respect API rate limits
-        'options': {'defaultType': 'swap'}  # Focus on perpetual futures
-    })
-
-# Initialize the exchange
-exchange = init_exchange()
-
-# Initialize session state if not already present
-if 'signals' not in st.session_state:
-    st.session_state.signals = []
-if 'scanned_markets' not in st.session_state:
-    st.session_state.scanned_markets = pd.DataFrame()
-if 'debug_info' not in st.session_state:
-    st.session_state.debug_info = {}
 
 # Database functions for state management
 def load_state_from_db():
@@ -139,40 +138,43 @@ def safe_float(value, default=0.0):
     except (ValueError, TypeError):
         return default
 
-def estimate_volume_from_orderbook(symbol, price):
-    """Estimate 24h volume from orderbook liquidity using CCXT"""
+def estimate_volume_from_orderbook(symbol):
+    """Estimate 24h volume from orderbook liquidity using Hyperliquid SDK"""
     try:
         # Fetch order book with retry
-        orderbook = api_request_with_retry(exchange.fetch_order_book, symbol)
+        orderbook = api_request_with_retry(info.orderbook, symbol)
         
         asks = orderbook.get('asks', [])
         bids = orderbook.get('bids', [])
         
+        if not asks or not bids:
+            return 0
+            
+        # Get mid price
+        best_bid = bids[0]['px']
+        best_ask = asks[0]['px']
+        price = (best_bid + best_ask) / 2
+        
         # Calculate liquidity within 2% of price
-        ask_liquidity = sum(amount for bid_price, amount in asks if bid_price <= price * 1.02)
-        bid_liquidity = sum(amount for ask_price, amount in bids if ask_price >= price * 0.98)
+        ask_liquidity = sum(level['sz'] for level in asks if level['px'] <= price * 1.02)
+        bid_liquidity = sum(level['sz'] for level in bids if level['px'] >= price * 0.98)
         
         # Estimate 24h volume as (bid + ask liquidity) * price * turnover factor
         return (ask_liquidity + bid_liquidity) * price * 4
         
     except Exception as e:
+        st.error(f"Error estimating volume for {symbol}: {str(e)}")
         return 0
 
 @st.cache_data(ttl=60)
 def fetch_all_markets():
-    """Fetch all perpetual contracts from Hyperliquid with individual API calls (fixed version)"""
+    """Fetch all perpetual contracts from Hyperliquid using the SDK"""
     try:
         debug_info = {}
         
-        # Load all markets
-        markets = api_request_with_retry(exchange.load_markets)
-        debug_info['total_markets'] = len(markets)
-        
-        # Filter for perpetual contracts only and exclude USDC pairs
-        perp_markets = {symbol: market for symbol, market in markets.items() 
-                       if market.get('swap', False) and not market.get('spot', True) 
-                       and not symbol.endswith('USDC:USDC')}
-        debug_info['perpetual_markets'] = len(perp_markets)
+        # Load all markets from Hyperliquid
+        meta = api_request_with_retry(info.meta)
+        debug_info['total_markets'] = len(meta['universe'])
         
         # Process market data
         market_data = []
@@ -183,33 +185,27 @@ def fetch_all_markets():
         status = st.empty()
         
         # Process markets individually
-        for i, (symbol, market) in enumerate(perp_markets.items()):
+        for i, coin in enumerate(meta['universe']):
+            symbol = coin['name']
             try:
                 # Update progress
-                progress_pct = (i + 1) / len(perp_markets)
+                progress_pct = (i + 1) / len(meta['universe'])
                 progress.progress(progress_pct)
-                status.text(f"Processing {i+1}/{len(perp_markets)}: {symbol}")
+                status.text(f"Processing {i+1}/{len(meta['universe'])}: {symbol}")
                 
-                # Try alternative methods to get price data
+                # Get price data
                 price = None
                 volume_24h = 0
                 
                 # Method 1: Try fetching order book
                 try:
-                    orderbook = api_request_with_retry(exchange.fetch_order_book, symbol, limit=1)
+                    orderbook = api_request_with_retry(info.orderbook, symbol)
                     if orderbook and 'bids' in orderbook and orderbook['bids']:
-                        price = orderbook['bids'][0][0]  # Use best bid as price estimate
+                        best_bid = orderbook['bids'][0]['px']
+                        best_ask = orderbook['asks'][0]['px'] if 'asks' in orderbook and orderbook['asks'] else best_bid
+                        price = (best_bid + best_ask) / 2
                 except:
                     pass
-                
-                # Method 2: Try fetching trades if orderbook fails
-                if price is None:
-                    try:
-                        trades = api_request_with_retry(exchange.fetch_trades, symbol, limit=1)
-                        if trades and len(trades) > 0:
-                            price = trades[0]['price']
-                    except:
-                        pass
                 
                 # Skip if we couldn't get price data
                 if price is None:
@@ -222,31 +218,31 @@ def fetch_all_markets():
                 
                 # Estimate volume from order book if needed
                 if st.session_state.use_orderbook_fallback:
-                    volume_24h = estimate_volume_from_orderbook(symbol, price)
+                    volume_24h = estimate_volume_from_orderbook(symbol)
                 
                 # Get funding rate
                 funding_rate = 0
                 try:
-                    funding_info = api_request_with_retry(exchange.fetch_funding_rate, symbol)
-                    if funding_info and 'fundingRate' in funding_info:
+                    funding_info = api_request_with_retry(info.funding_history, symbol, 1)
+                    if funding_info and len(funding_info) > 0:
                         # Convert to annualized basis points (assuming 8h funding periods)
-                        funding_rate = safe_float(funding_info['fundingRate']) * 10000 * 3 * 365
+                        funding_rate = safe_float(funding_info[0]['fundingRate']) * 10000 * 3 * 365
                 except Exception as e:
                     debug_info[f'funding_error_{symbol}'] = str(e)
                 
                 # Get open interest
                 open_interest = 0
                 try:
-                    oi_data = api_request_with_retry(exchange.fetch_open_interest, symbol)
-                    if oi_data and 'openInterestAmount' in oi_data:
-                        open_interest = safe_float(oi_data['openInterestAmount']) * price
+                    oi_data = api_request_with_retry(info.open_interest)
+                    oi_entry = next((item for item in oi_data if item['coin'] == symbol), None)
+                    if oi_entry:
+                        open_interest = safe_float(oi_entry['openInterest']) * price
                 except Exception as e:
                     debug_info[f'oi_error_{symbol}'] = str(e)
                 
                 # Store special coins for debugging
-                base_currency = market['base']
-                if base_currency in ['BTC', 'ETH', 'SOL']:
-                    debug_info[f'{base_currency}_details'] = {
+                if symbol in ['BTC', 'ETH', 'SOL']:
+                    debug_info[f'{symbol}_details'] = {
                         'symbol': symbol,
                         'price': price,
                         'volume': volume_24h,
@@ -263,12 +259,21 @@ def fetch_all_markets():
                     })
                     continue
                 
-                # Calculate price change - we can't get this without ticker data
+                # Calculate price change - we'll get this from candles
                 change_24h = 0
+                try:
+                    candles = api_request_with_retry(info.candles_snapshot, symbol, '1h', int((datetime.now() - timedelta(days=1)).timestamp() * 1000), int(datetime.now().timestamp() * 1000))
+                    if candles and len(candles) > 0:
+                        oldest_price = safe_float(candles[0][4])  # open price
+                        latest_price = safe_float(candles[-1][5])  # close price
+                        if oldest_price > 0:
+                            change_24h = ((latest_price - oldest_price) / oldest_price) * 100
+                except Exception as e:
+                    debug_info[f'change_error_{symbol}'] = str(e)
                 
                 market_data.append({
-                    'symbol': base_currency,         # Use base currency as symbol for simplicity
-                    'full_symbol': symbol,          # Keep full exchange symbol as reference
+                    'symbol': symbol,
+                    'full_symbol': symbol,  # For consistency with previous version
                     'markPrice': price,
                     'lastPrice': price,
                     'fundingRate': funding_rate,
@@ -306,11 +311,12 @@ def fetch_all_markets():
         st.error(f"Error fetching markets: {str(e)}")
         st.session_state.debug_info['fetch_error'] = str(e)
         return pd.DataFrame()
+
 @st.cache_data(ttl=300)
 def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
-    """Fetch OHLCV data for a specific symbol using CCXT with retries"""
+    """Fetch OHLCV data for a specific symbol using Hyperliquid SDK"""
     try:
-        # Map interval string to CCXT timeframe
+        # Map interval string to Hyperliquid timeframe
         timeframe_map = {
             '1h': '1h',
             '4h': '4h',
@@ -318,28 +324,24 @@ def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
         }
         timeframe = timeframe_map.get(interval, '1h')
         
-        # Need to find the full symbol for the coin
-        markets = exchange.load_markets()
-        full_symbol = None
+        # Calculate start and end times
+        end_time = int(datetime.now().timestamp() * 1000)
         
-        # Find the corresponding full symbol (excluding USDC pairs)
-        for sym in markets:
-            if markets[sym]['type'] == 'swap' and markets[sym]['base'] == symbol and not sym.endswith('USDC:USDC'):
-                full_symbol = sym
-                break
-        
-        if not full_symbol:
-            st.warning(f"Could not find full symbol for {symbol} (excluding USDC pairs)")
-            return None
+        if interval == '1h':
+            start_time = end_time - (limit * 60 * 60 * 1000)
+        elif interval == '4h':
+            start_time = end_time - (limit * 4 * 60 * 60 * 1000)
+        else:  # 1d
+            start_time = end_time - (limit * 24 * 60 * 60 * 1000)
         
         # Fetch OHLCV data with retry
-        ohlcv = api_request_with_retry(exchange.fetch_ohlcv, full_symbol, timeframe, limit=limit)
+        ohlcv = api_request_with_retry(info.candles_snapshot, symbol, timeframe, start_time, end_time)
         
         if not ohlcv or len(ohlcv) == 0:
             return None
             
         # Convert to DataFrame
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'time_close', 'symbol', 'interval', 'open', 'close', 'high', 'low', 'volume', 'num'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
         return df
@@ -676,7 +678,7 @@ def scan_markets():
                             st.info("Debug info for BTC:")
                             st.json(debug['BTC_details'])
                     else:
-                        st.error("No market data found. Check CCXT connection.")
+                        st.error("No market data found. Check Hyperliquid connection.")
                 return
                 
             # Store markets in session state
@@ -986,36 +988,25 @@ with tab5:
 with tab6:
     st.header("Debug Information")
     
-    # CCXT Exchange Info
-    st.subheader("CCXT Exchange Info")
+    # Hyperliquid Info
+    st.subheader("Hyperliquid Connection Info")
     
-    # Test CCXT connection
-    if st.button("Test CCXT Connection"):
+    # Test Hyperliquid connection
+    if st.button("Test Hyperliquid Connection"):
         try:
             # Get exchange status
-            version = exchange.version if hasattr(exchange, 'version') else 'Unknown'
-            has_features = ', '.join([f for f, v in exchange.has.items() if v])
+            meta = info.meta()
             
-            st.success(f"CCXT Hyperliquid connection established")
-            st.write(f"CCXT Version: {version}")
-            
-            # Test loading markets
-            markets = exchange.load_markets()
-            perp_markets = {k: v for k, v in markets.items() if v.get('type') == 'swap' and not k.endswith('USDC:USDC')}
-            
-            st.write(f"Total markets: {len(markets)}")
-            st.write(f"Perpetual markets (excluding USDC): {len(perp_markets)}")
+            st.success("Hyperliquid connection established")
+            st.write(f"Total markets: {len(meta['universe'])}")
             
             # Show sample market details
-            if perp_markets:
-                sample_symbol = list(perp_markets.keys())[0]
+            if len(meta['universe']) > 0:
+                sample_symbol = meta['universe'][0]['name']
                 st.write(f"Sample market: {sample_symbol}")
-                st.json(perp_markets[sample_symbol])
-            
-            # Test fetching order book
-            if perp_markets:
-                sample_symbol = list(perp_markets.keys())[0]
-                orderbook = exchange.fetch_order_book(sample_symbol)
+                
+                # Show sample order book
+                orderbook = info.orderbook(sample_symbol)
                 st.write(f"Order book data for {sample_symbol}:")
                 st.json({
                     'bids': orderbook['bids'][:2] if 'bids' in orderbook else [],
@@ -1023,7 +1014,7 @@ with tab6:
                 })
         
         except Exception as e:
-            st.error(f"CCXT connection test failed: {str(e)}")
+            st.error(f"Hyperliquid connection test failed: {str(e)}")
     
     # Show debug info
     if st.session_state.debug_info:
