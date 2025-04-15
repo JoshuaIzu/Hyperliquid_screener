@@ -84,6 +84,18 @@ def save_state_to_db(active_trades, completed_trades):
     conn.commit()
     conn.close()
 
+# Hyperliquid API Functions
+@st.cache_data(ttl=30)
+def fetch_hyperliquid_meta():
+    """Fetch metadata about available markets on Hyperliquid"""
+    try:
+        response = requests.post(HYPERLIQUID_INFO_API, json={"type": "meta"})
+        data = response.json()
+        return data
+    except Exception as e:
+        st.error(f"Error fetching metadata: {str(e)}")
+        return None
+
 @st.cache_data(ttl=60)
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid with comprehensive market data"""
@@ -112,7 +124,20 @@ def fetch_all_markets():
         
         debug_info['coins'] = coins
         
-        # Get prices using the oracle endpoint
+        # Get all stats - contains open interest and volume
+        stats_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "stats"})
+        stats_data = {}
+        debug_info['raw_stats_response'] = stats_response.status_code
+        
+        if stats_response.status_code == 200:
+            stats_result = stats_response.json()
+            debug_info['stats_sample'] = stats_result[:3] if stats_result else []
+            
+            for stat in stats_result:
+                if isinstance(stat, dict) and 'coin' in stat:
+                    stats_data[stat['coin']] = stat
+        
+        # Get all prices using the oracle endpoint
         prices_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "oracle"})
         prices_data = {}
         debug_info['prices_response'] = prices_response.status_code
@@ -142,87 +167,37 @@ def fetch_all_markets():
         markets = []
         skipped_markets = []
         
-        # Get stats data for all markets
-        stats_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "stats"})
-        stats_data = {}
-        
-        if stats_response.status_code == 200:
-            stats_result = stats_response.json()
-            for stat in stats_result:
-                if isinstance(stat, dict) and 'coin' in stat:
-                    stats_data[stat['coin']] = stat
-        
-        # Get all orderbooks to calculate approximate volume
         for coin in coins:
             try:
                 # Get price
                 price = prices_data.get(coin, 0)
-                if price == 0:
-                    continue  # Skip if no price available
                 
-                # Get open interest from stats
-                open_interest = 0
-                if coin in stats_data:
-                    open_interest_raw = stats_data[coin].get('openInterest', 0)
-                    if isinstance(open_interest_raw, str):
-                        open_interest = float(open_interest_raw.replace(',', ''))
-                    else:
-                        open_interest = float(open_interest_raw)
+                # Get stats
+                stats = stats_data.get(coin, {})
                 
-                # Estimate 24h volume using orderbook data
-                # Calculate liquidity within 2% of current price
-                orderbook_response = requests.post(
-                    HYPERLIQUID_INFO_API, 
-                    json={"type": "l2Book", "coin": coin}
-                )
+                # Get volume - fix for handling string values and scientific notation
+                volume_24h_raw = stats.get('volume24h', 0)
                 
-                volume_24h = 0
+                # Convert to float, handling both string and numeric formats
+                if isinstance(volume_24h_raw, str):
+                    # Remove commas and convert to float
+                    volume_24h = float(volume_24h_raw.replace(',', ''))
+                else:
+                    volume_24h = float(volume_24h_raw)
                 
-                if orderbook_response.status_code == 200:
-                    orderbook = orderbook_response.json()
-                    asks = orderbook.get('asks', [])
-                    bids = orderbook.get('bids', [])
-                    
-                    # Calculate volume within 2% of mid price
-                    liquid_asks = [
-                        [float(level[0]), float(level[1])]
-                        for level in asks 
-                        if float(level[0]) <= price * 1.02
-                    ]
-                    
-                    liquid_bids = [
-                        [float(level[0]), float(level[1])]
-                        for level in bids
-                        if float(level[0]) >= price * 0.98
-                    ]
-                    
-                    # Sum up the liquidity (size * price) within threshold
-                    ask_liquidity = sum(level[0] * level[1] for level in liquid_asks)
-                    bid_liquidity = sum(level[0] * level[1] for level in liquid_bids)
-                    
-                    # Estimate volume as total liquidity * typical daily turnover
-                    # Daily turnover is typically 3-5x the orderbook liquidity
-                    orderbook_liquidity = ask_liquidity + bid_liquidity
-                    volume_24h = orderbook_liquidity * 4  # Conservative estimate
-                    
-                    # Store sample orderbook data for debugging
-                    if coin in ['BTC', 'ETH', 'SOL']:
-                        debug_info[f'{coin}_orderbook'] = {
-                            'price': price,
-                            'ask_liquidity': ask_liquidity,
-                            'bid_liquidity': bid_liquidity,
-                            'total_liquidity': orderbook_liquidity,
-                            'estimated_volume': volume_24h
-                        }
+                # Get open interest with similar handling
+                open_interest_raw = stats.get('openInterest', 0)
+                if isinstance(open_interest_raw, str):
+                    open_interest = float(open_interest_raw.replace(',', ''))
+                else:
+                    open_interest = float(open_interest_raw)
                 
                 # For debugging
-                if coin in ['BTC', 'ETH', 'SOL', 'SUI']:
+                if coin in ['BTC-USD', 'ETH-USD', 'SOL-USD', 'SUI-USD']:
                     skipped_markets.append({
                         'symbol': coin,
-                        'price': price,
                         'volume24h': volume_24h,
-                        'open_interest': open_interest,
-                        'calculated_from': 'orderbook',
+                        'raw_volume': volume_24h_raw,
                         'min_required': MIN_LIQUIDITY
                     })
                 
@@ -230,10 +205,8 @@ def fetch_all_markets():
                 if volume_24h < MIN_LIQUIDITY:
                     skipped_markets.append({
                         'symbol': coin,
-                        'price': price,
                         'volume24h': volume_24h,
-                        'open_interest': open_interest,
-                        'calculated_from': 'orderbook',
+                        'raw_volume': volume_24h_raw,
                         'min_required': MIN_LIQUIDITY
                     })
                     continue
@@ -341,7 +314,6 @@ with st.sidebar:
     
     # Updated MIN_LIQUIDITY with lower options
     liquidity_options = {
-        "50,000 USD": 50000,
         "100,000 USD": 100000,
         "200,000 USD": 200000,
         "300,000 USD": 300000,
@@ -353,7 +325,7 @@ with st.sidebar:
     selected_liquidity = st.selectbox(
         "Minimum Liquidity",
         options=list(liquidity_options.keys()),
-        index=1  # Default to 100,000
+        index=0  # Default to 100,000
     )
     
     MIN_LIQUIDITY = liquidity_options[selected_liquidity]
@@ -959,80 +931,6 @@ with tab6:
         except Exception as e:
             st.error(f"API connection test failed: {str(e)}")
     
-    # Order Book Volume Estimation tester
-    st.subheader("Order Book Volume Estimation")
-    test_coin = st.text_input("Enter coin to analyze orderbook", "BTC")
-    
-    if st.button("Test Order Book Volume Estimation"):
-        try:
-            # Get price
-            price_response = requests.post(
-                HYPERLIQUID_INFO_API,
-                json={"type": "oracle", "coin": test_coin}
-            )
-            
-            if price_response.status_code == 200:
-                price = float(price_response.json().get('price', 0))
-                
-                # Get orderbook
-                orderbook_response = requests.post(
-                    HYPERLIQUID_INFO_API,
-                    json={"type": "l2Book", "coin": test_coin}
-                )
-                
-                if orderbook_response.status_code == 200:
-                    orderbook = orderbook_response.json()
-                    asks = orderbook.get('asks', [])
-                    bids = orderbook.get('bids', [])
-                    
-                    # Calculate volume within 2% of mid price
-                    liquid_asks = [
-                        [float(level[0]), float(level[1])]
-                        for level in asks
-                        if float(level[0]) <= price * 1.02
-                    ]
-                    
-                    liquid_bids = [
-                        [float(level[0]), float(level[1])]
-                        for level in bids
-                        if float(level[0]) >= price * 0.98
-                    ]
-                    
-                    # Display orderbook summary
-                    st.write(f"Current price: ${price:.4f}")
-                    st.write(f"Total ask levels: {len(asks)}")
-                    st.write(f"Total bid levels: {len(bids)}")
-                    st.write(f"Liquid ask levels (within 2%): {len(liquid_asks)}")
-                    st.write(f"Liquid bid levels (within 2%): {len(liquid_bids)}")
-                    
-                    # Sum up the liquidity
-                    ask_liquidity = sum(level[0] * level[1] for level in liquid_asks)
-                    bid_liquidity = sum(level[0] * level[1] for level in liquid_bids)
-                    total_liquidity = ask_liquidity + bid_liquidity
-                    
-                    st.write(f"Ask liquidity: ${ask_liquidity:,.2f}")
-                    st.write(f"Bid liquidity: ${bid_liquidity:,.2f}")
-                    st.write(f"Total liquidity: ${total_liquidity:,.2f}")
-                    
-                    # Estimated 24h volume with different multipliers
-                    st.write("Estimated 24h volume with different turnover multipliers:")
-                    for mult in [2, 3, 4, 5, 10]:
-                        st.write(f"  {mult}x: ${total_liquidity * mult:,.2f}")
-                    
-                    # Show first few levels of the orderbook
-                    st.subheader("Sample Orderbook Levels")
-                    st.write("Asks (first 5):")
-                    for i, level in enumerate(asks[:5]):
-                        st.write(f"  {i+1}. Price: ${float(level[0]):.4f}, Size: {float(level[1]):.4f}")
-                    
-                    st.write("Bids (first 5):")
-                    for i, level in enumerate(bids[:5]):
-                        st.write(f"  {i+1}. Price: ${float(level[0]):.4f}, Size: {float(level[1]):.4f}")
-            else:
-                st.error(f"Failed to get price: {price_response.status_code}")
-        except Exception as e:
-            st.error(f"Error analyzing orderbook: {str(e)}")
-    
     # Show debug info if available
     if st.session_state.debug_info:
         st.subheader("Last Scan Debug Info")
@@ -1048,28 +946,31 @@ with tab6:
             skipped_df = pd.DataFrame(st.session_state.debug_info['skipped_markets'][:5])  # Show first 5
             st.dataframe(skipped_df)
         
-        # Show special debug info for major coins
-        for coin in ['BTC', 'ETH', 'SOL']:
-            if f'{coin}_orderbook' in st.session_state.debug_info:
-                st.subheader(f"{coin} Orderbook Analysis")
-                st.json(st.session_state.debug_info[f'{coin}_orderbook'])
+        # Show any errors
+        errors = {k: v for k, v in st.session_state.debug_info.items() if k.startswith('error')}
+        if errors:
+            st.subheader("Errors")
+            for k, v in errors.items():
+                st.error(f"{k}: {v}")
+    
+    # Cache status
+    st.subheader("Cache Status")
+    if os.path.exists('market_cache.db'):
+        conn = sqlite3.connect('market_cache.db')
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM market_cache")
+        market_cache_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM ohlcv_cache")
+        ohlcv_cache_count = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        st.write(f"Markets in cache: {market_cache_count}")
+        st.write(f"OHLCV data sets in cache: {ohlcv_cache_count}")
+    else:
+        st.write("Cache database not found.")
 
-# Footer with information and credits
-st.markdown("---")
-st.markdown("""
-### About this Application
-
-This Hyperliquid Futures Market Screener provides traders with tools to identify and act on opportunities in cryptocurrency futures markets. The application:
-
-1. Scans Hyperliquid futures markets for trading opportunities
-2. Analyzes volume patterns and funding rates to generate signals
-3. Allows forward testing of strategies with automatic trade management
-4. Tracks and visualizes trading performance
-
-#### Citation and Credits
-
-**Built by**: DataTales Dev Team (2024)  
-**Hyperliquid API**: [Hyperliquid Documentation](https://hyperliquid.xyz/docs)
-
-If you use this tool for research or commercial purposes, please cite:
-""")
+# Update timestamp in the footer
+st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
