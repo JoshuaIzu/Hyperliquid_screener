@@ -92,71 +92,90 @@ def fetch_hyperliquid_meta():
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid with comprehensive market data"""
     try:
-        # Fetch all mid prices
-        response = requests.post(HYPERLIQUID_INFO_API, json={
-            "type": "allMids"
-        })
+        # Start with fetching the metadata to get the list of available coins
+        meta_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "meta"})
         
-        if response.status_code != 200:
-            st.error(f"API request failed with status {response.status_code}")
+        if meta_response.status_code != 200:
+            st.error(f"Meta API request failed with status {meta_response.status_code}")
             return pd.DataFrame()
             
-        mids_data = response.json()
+        meta_data = meta_response.json()
         
-        # Fetch funding rates separately
-        funding_response = requests.post(HYPERLIQUID_INFO_API, json={
-            "type": "fundingHistory"
-        })
+        # Extract coins from universe list
+        coins = []
+        if 'universe' in meta_data and isinstance(meta_data['universe'], list):
+            coins = [asset['name'] for asset in meta_data['universe'] if isinstance(asset, dict) and 'name' in asset]
         
+        if not coins:
+            st.error("No coins found in meta data")
+            return pd.DataFrame()
+        
+        # Now get all market contexts
+        contexts_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "allContractMetas"})
+        
+        if contexts_response.status_code != 200:
+            st.error(f"Context API request failed with status {contexts_response.status_code}")
+            return pd.DataFrame()
+            
+        context_data = contexts_response.json()
+        
+        # Get all stats
+        stats_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "stats"})
+        stats_data = {}
+        
+        if stats_response.status_code == 200:
+            stats_result = stats_response.json()
+            for stat in stats_result:
+                if isinstance(stat, dict) and 'coin' in stat:
+                    stats_data[stat['coin']] = stat
+        
+        # Get all prices
+        prices_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "oracle"})
+        prices_data = {}
+        
+        if prices_response.status_code == 200:
+            prices_result = prices_response.json()
+            if isinstance(prices_result, list):
+                for price in prices_result:
+                    if isinstance(price, dict) and 'coin' in price and 'price' in price:
+                        prices_data[price['coin']] = float(price['price'])
+
+        # Get funding rates
+        funding_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "funding"})
         funding_data = {}
+        
         if funding_response.status_code == 200:
             funding_result = funding_response.json()
-            for item in funding_result:
-                if 'coin' in item and 'fundingRate' in item:
-                    # Convert funding rate to annualized basis points
-                    funding_data[item['coin']] = float(item['fundingRate']) * 10000 * 365 * 24
-        
-        # Get additional market stats
-        stats_response = requests.post(HYPERLIQUID_INFO_API, json={
-            "type": "metaAndAssetCtxs"
-        })
-        
-        stats_data = None
-        if stats_response.status_code == 200:
-            stats_data = stats_response.json()
-        
-        # Process market data
-        markets = []
-        for item in mids_data:
-            try:
-                symbol = item['coin']
-                mid_price = float(item['mid'])
-                
-                # Get funding rate
-                funding_rate = funding_data.get(symbol, 0)
-                
-                # Get open interest and volume
-                open_interest = 0
-                volume_24h = 0
-                
-                if stats_data:
-                    asset_ctx = next(
-                        (asset for asset in stats_data.get('universe', []) 
-                        if asset['name'] == symbol
-                    ), None)
-                    
-                    if asset_ctx:
-                        open_interest = float(asset_ctx.get('openInterest', 0))
-                        volume_24h = float(asset_ctx.get('volume24h', 0))
+            if isinstance(funding_result, list):
+                for item in funding_result:
+                    if isinstance(item, dict) and 'coin' in item and 'funding' in item:
+                        # Convert funding rate to annualized basis points
+                        funding_data[item['coin']] = float(item['funding']) * 10000 * 365 * 24
 
+        # Process market data for each coin
+        markets = []
+        
+        for coin in coins:
+            try:
+                # Get price
+                price = prices_data.get(coin, 0)
+                
+                # Get stats
+                stats = stats_data.get(coin, {})
+                volume_24h = float(stats.get('volume24h', 0))
+                open_interest = float(stats.get('openInterest', 0))
+                
                 # Skip low liquidity markets
                 if volume_24h < MIN_LIQUIDITY:
                     continue
-
+                
+                # Get funding rate
+                funding_rate = funding_data.get(coin, 0)
+                
                 markets.append({
-                    'symbol': symbol,
-                    'markPrice': mid_price,
-                    'lastPrice': mid_price,  # Using mid as last price
+                    'symbol': coin,
+                    'markPrice': price,
+                    'lastPrice': price,
                     'fundingRate': funding_rate,
                     'openInterest': open_interest,
                     'volume24h': volume_24h,
@@ -165,23 +184,27 @@ def fetch_all_markets():
                 })
                 
             except Exception as e:
-                st.warning(f"Error processing {symbol if 'symbol' in locals() else 'unknown'}: {str(e)}")
+                st.warning(f"Error processing {coin}: {str(e)}")
                 continue
         
         # Create DataFrame with all market data
         df = pd.DataFrame(markets)
+        
         if df.empty:
             return df
             
         # Calculate 24h change from candles for each market
         for symbol in df['symbol']:
-            candles = fetch_hyperliquid_candles(symbol, interval='1d', limit=2)
-            if candles is not None and len(candles) >= 2:
-                prev_close = candles.iloc[-2]['close']
-                current_close = candles.iloc[-1]['close']
-                df.loc[df['symbol'] == symbol, 'change24h'] = (
-                    (current_close - prev_close) / prev_close * 100
-                )
+            try:
+                candles = fetch_hyperliquid_candles(symbol, interval='1d', limit=2)
+                if candles is not None and len(candles) >= 2:
+                    prev_close = candles.iloc[-2]['close']
+                    current_close = candles.iloc[-1]['close']
+                    df.loc[df['symbol'] == symbol, 'change24h'] = (
+                        (current_close - prev_close) / prev_close * 100
+                    )
+            except Exception as e:
+                pass  # Silently continue if we can't get change data
         
         return df.sort_values('volume24h', ascending=False)
         
