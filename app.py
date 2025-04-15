@@ -10,14 +10,14 @@ import sqlite3
 import requests
 import time
 
-# Try to import the Hyperliquid SDK
+# Try to import the Hyperliquid SDK with the correct name
 try:
     from hyperliquid.info import Info
     from hyperliquid.exchange import Exchange
     HAS_HYPERLIQUID_SDK = True
 except ImportError:
     HAS_HYPERLIQUID_SDK = False
-    st.warning("Hyperliquid SDK not installed. Check requirements.txt includes 'hyperliquid'.")
+    st.warning("Hyperliquid SDK not installed. Add 'hyperliquid-python-sdk' to your requirements.txt file.")
 
 # Set page config
 st.set_page_config(
@@ -30,7 +30,7 @@ st.set_page_config(
 st.title("📈 Hyperliquid Futures Market Screener")
 st.markdown("Track and analyze cryptocurrency futures markets on Hyperliquid")
 
-# Hyperliquid API Endpoints (fallback if SDK fails)
+# Hyperliquid API Endpoints
 HYPERLIQUID_INFO_API = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_EXCHANGE_API = "https://api.hyperliquid.xyz/exchange"
 
