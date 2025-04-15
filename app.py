@@ -110,16 +110,7 @@ def fetch_all_markets():
             st.error("No coins found in meta data")
             return pd.DataFrame()
         
-        # Now get all market contexts
-        contexts_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "allContractMetas"})
-        
-        if contexts_response.status_code != 200:
-            st.error(f"Context API request failed with status {contexts_response.status_code}")
-            return pd.DataFrame()
-            
-        context_data = contexts_response.json()
-        
-        # Get all stats
+        # Get all stats - contains open interest and volume
         stats_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "stats"})
         stats_data = {}
         
@@ -129,7 +120,7 @@ def fetch_all_markets():
                 if isinstance(stat, dict) and 'coin' in stat:
                     stats_data[stat['coin']] = stat
         
-        # Get all prices
+        # Get all prices using the oracle endpoint
         prices_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "oracle"})
         prices_data = {}
         
@@ -162,8 +153,8 @@ def fetch_all_markets():
                 
                 # Get stats
                 stats = stats_data.get(coin, {})
-                volume_24h = float(stats.get('volume24h', 0))
-                open_interest = float(stats.get('openInterest', 0))
+                volume_24h = float(stats.get('volume24h', 0)) if stats else 0
+                open_interest = float(stats.get('openInterest', 0)) if stats else 0
                 
                 # Skip low liquidity markets
                 if volume_24h < MIN_LIQUIDITY:
@@ -204,7 +195,8 @@ def fetch_all_markets():
                         (current_close - prev_close) / prev_close * 100
                     )
             except Exception as e:
-                pass  # Silently continue if we can't get change data
+                # Just skip if we can't get change data
+                pass
         
         return df.sort_values('volume24h', ascending=False)
         
