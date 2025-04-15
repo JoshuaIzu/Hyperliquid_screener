@@ -170,7 +170,8 @@ def fetch_all_markets():
         
         # Filter for perpetual contracts only and exclude USDC pairs
         perp_markets = {symbol: market for symbol, market in markets.items() 
-                       if market['type'] == 'swap' and not market['spot'] and not symbol.endswith('USDC:USDC')}
+                       if market.get('swap', False) and not market.get('spot', True) 
+                       and not symbol.endswith('USDC:USDC')}
         debug_info['perpetual_markets'] = len(perp_markets)
         
         # Process market data
@@ -305,7 +306,6 @@ def fetch_all_markets():
         st.error(f"Error fetching markets: {str(e)}")
         st.session_state.debug_info['fetch_error'] = str(e)
         return pd.DataFrame()
-
 @st.cache_data(ttl=300)
 def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
     """Fetch OHLCV data for a specific symbol using CCXT with retries"""
