@@ -251,7 +251,7 @@ with st.sidebar:
     st.header("Parameters")
     BASE_VOL = st.slider("Base Volume Threshold", 0.1, 2.0, 0.35, 0.05)
     VOL_MULTIPLIER = st.slider("Volume Multiplier", 1.0, 3.0, 1.5, 0.1)
-    MIN_LIQUIDITY = st.number_input("Minimum Liquidity (USD)", 1000000, 20000000, 5000000, 1000000)
+    MIN_LIQUIDITY = st.number_input("Minimum Liquidity (USD)", 200000, 500000,1000000, 20000000, 5000000, 1000000)
     FUNDING_THRESHOLD = st.slider("Funding Rate Threshold (basis points)", 10, 200, 60, 5)
 
 class ForwardTester:
