@@ -1072,3 +1072,4 @@ This Hyperliquid Futures Market Screener provides traders with tools to identify
 **Hyperliquid API**: [Hyperliquid Documentation](https://hyperliquid.xyz/docs)
 
 If you use this tool for research or commercial purposes, please cite:
+""")
