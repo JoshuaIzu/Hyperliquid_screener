@@ -28,7 +28,7 @@ HYPERLIQUID_EXCHANGE_API = "https://api.hyperliquid.xyz/exchange"
 # Configuration
 BASE_VOL = 0.35
 VOL_MULTIPLIER = 1.5
-MIN_LIQUIDITY = 500000
+MIN_LIQUIDITY = 500000  # Changed default to 500k
 FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
 
 # Database functions for state management
@@ -251,7 +251,25 @@ with st.sidebar:
     st.header("Parameters")
     BASE_VOL = st.slider("Base Volume Threshold", 0.1, 2.0, 0.35, 0.05)
     VOL_MULTIPLIER = st.slider("Volume Multiplier", 1.0, 3.0, 1.5, 0.1)
-    MIN_LIQUIDITY = st.number_input("Minimum Liquidity (USD)", 1000000, 20000000, 5000000, 1000000)
+    
+    # Updated MIN_LIQUIDITY with lower options
+    liquidity_options = {
+        "100,000 USD": 100000,
+        "200,000 USD": 200000,
+        "300,000 USD": 300000,
+        "500,000 USD": 500000,
+        "1,000,000 USD": 1000000,
+        "5,000,000 USD": 5000000
+    }
+    
+    selected_liquidity = st.selectbox(
+        "Minimum Liquidity",
+        options=list(liquidity_options.keys()),
+        index=3  # Default to 500,000
+    )
+    
+    MIN_LIQUIDITY = liquidity_options[selected_liquidity]
+    
     FUNDING_THRESHOLD = st.slider("Funding Rate Threshold (basis points)", 10, 200, 60, 5)
 
 class ForwardTester:
@@ -505,6 +523,9 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["Market Scanner", "Active Trades", "Comp
 
 # Tab 1: Market Scanner
 with tab1:
+    # Display current liquidity setting
+    st.info(f"Current Minimum Liquidity: ${MIN_LIQUIDITY:,} USD")
+    
     if st.button("Scan Markets"):
         with st.spinner("Scanning all Hyperliquid perpetual markets..."):
             markets_df = fetch_all_markets()
