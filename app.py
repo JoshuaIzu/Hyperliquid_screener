@@ -92,46 +92,62 @@ def fetch_hyperliquid_meta():
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid with comprehensive market data"""
     try:
-        # Fetch all market data in a single optimized request
+        # Fetch all mid prices
         response = requests.post(HYPERLIQUID_INFO_API, json={
-            "type": "allMidsAndFunding"
+            "type": "allMids"
         })
         
         if response.status_code != 200:
             st.error(f"API request failed with status {response.status_code}")
             return pd.DataFrame()
             
-        data = response.json()
+        mids_data = response.json()
         
-        # Verify response structure
-        if not isinstance(data, dict) or 'mids' not in data or 'funding' not in data:
-            st.warning("Unexpected API response format")
-            return pd.DataFrame()
-
+        # Fetch funding rates separately
+        funding_response = requests.post(HYPERLIQUID_INFO_API, json={
+            "type": "fundingHistory"
+        })
+        
+        funding_data = {}
+        if funding_response.status_code == 200:
+            funding_result = funding_response.json()
+            for item in funding_result:
+                if 'coin' in item and 'fundingRate' in item:
+                    # Convert funding rate to annualized basis points
+                    funding_data[item['coin']] = float(item['fundingRate']) * 10000 * 365 * 24
+        
+        # Get additional market stats
+        stats_response = requests.post(HYPERLIQUID_INFO_API, json={
+            "type": "metaAndAssetCtxs"
+        })
+        
+        stats_data = None
+        if stats_response.status_code == 200:
+            stats_data = stats_response.json()
+        
         # Process market data
         markets = []
-        for symbol, price_data in data['mids'].items():
+        for item in mids_data:
             try:
-                # Get funding rate (convert to annualized basis points)
-                funding_rate = float(data['funding'].get(symbol, 0)) * 10000 * 365 * 24
+                symbol = item['coin']
+                mid_price = float(item['mid'])
                 
-                # Get additional market stats
-                stats_response = requests.post(HYPERLIQUID_INFO_API, json={
-                    "type": "metaAndAssetCtxs"
-                })
+                # Get funding rate
+                funding_rate = funding_data.get(symbol, 0)
                 
-                if stats_response.status_code == 200:
-                    stats_data = stats_response.json()
+                # Get open interest and volume
+                open_interest = 0
+                volume_24h = 0
+                
+                if stats_data:
                     asset_ctx = next(
-                        (asset for asset in stats_data['universe'] 
+                        (asset for asset in stats_data.get('universe', []) 
                         if asset['name'] == symbol
                     ), None)
                     
-                    open_interest = float(asset_ctx['openInterest']) if asset_ctx else 0
-                    volume_24h = float(asset_ctx['volume24h']) if asset_ctx else 0
-                else:
-                    open_interest = 0
-                    volume_24h = 0
+                    if asset_ctx:
+                        open_interest = float(asset_ctx.get('openInterest', 0))
+                        volume_24h = float(asset_ctx.get('volume24h', 0))
 
                 # Skip low liquidity markets
                 if volume_24h < MIN_LIQUIDITY:
@@ -139,8 +155,8 @@ def fetch_all_markets():
 
                 markets.append({
                     'symbol': symbol,
-                    'markPrice': float(price_data['mid']),
-                    'lastPrice': float(price_data['mid']),  # Using mid as last price
+                    'markPrice': mid_price,
+                    'lastPrice': mid_price,  # Using mid as last price
                     'fundingRate': funding_rate,
                     'openInterest': open_interest,
                     'volume24h': volume_24h,
@@ -149,12 +165,14 @@ def fetch_all_markets():
                 })
                 
             except Exception as e:
-                st.warning(f"Error processing {symbol}: {str(e)}")
+                st.warning(f"Error processing {symbol if 'symbol' in locals() else 'unknown'}: {str(e)}")
                 continue
         
         # Create DataFrame with all market data
         df = pd.DataFrame(markets)
-        
+        if df.empty:
+            return df
+            
         # Calculate 24h change from candles for each market
         for symbol in df['symbol']:
             candles = fetch_hyperliquid_candles(symbol, interval='1d', limit=2)
