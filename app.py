@@ -28,7 +28,7 @@ HYPERLIQUID_EXCHANGE_API = "https://api.hyperliquid.xyz/exchange"
 # Configuration
 BASE_VOL = 0.35
 VOL_MULTIPLIER = 1.5
-MIN_LIQUIDITY = 100000  # Lowest default to 100k
+MIN_LIQUIDITY = 50000  # Lower default to 50k
 FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
 
 # Initialize session state if not already present
@@ -83,6 +83,49 @@ def save_state_to_db(active_trades, completed_trades):
     
     conn.commit()
     conn.close()
+
+# Function to estimate volume from orderbook data
+def estimate_volume_from_orderbook(coin, price):
+    """Estimate 24h volume from orderbook liquidity"""
+    try:
+        # Get orderbook data
+        response = requests.post(HYPERLIQUID_INFO_API, json={"type": "l2Book", "coin": coin})
+        if response.status_code != 200:
+            return 0
+        
+        orderbook = response.json()
+        if not orderbook:
+            return 0
+
+        asks = orderbook.get('asks', [])
+        bids = orderbook.get('bids', [])
+
+        # Calculate liquidity within 2% of mid price
+        liquid_asks = [
+            [float(level[0]), float(level[1])]
+            for level in asks 
+            if float(level[0]) <= price * 1.02
+        ]
+        
+        liquid_bids = [
+            [float(level[0]), float(level[1])]
+            for level in bids
+            if float(level[0]) >= price * 0.98
+        ]
+        
+        # Sum up the liquidity (size * price) within threshold
+        ask_liquidity = sum(level[0] * level[1] for level in liquid_asks)
+        bid_liquidity = sum(level[0] * level[1] for level in liquid_bids)
+        
+        # Estimate volume as total liquidity * typical daily turnover (5x)
+        # Using a multiplier to account for typical daily volume
+        volume_24h = (ask_liquidity + bid_liquidity) * 5
+        
+        return volume_24h
+
+    except Exception as e:
+        st.session_state.debug_info[f'orderbook_error_{coin}'] = str(e)
+        return 0
 
 # Hyperliquid API Functions
 @st.cache_data(ttl=30)
@@ -167,23 +210,18 @@ def fetch_all_markets():
         markets = []
         skipped_markets = []
         
+        # Get volume estimation method from session state
+        volume_method = st.session_state.get('volume_method', 'Orderbook-based')
+        
         for coin in coins:
             try:
                 # Get price
                 price = prices_data.get(coin, 0)
+                if price <= 0:
+                    continue
                 
                 # Get stats
                 stats = stats_data.get(coin, {})
-                
-                # Get volume - fix for handling string values and scientific notation
-                volume_24h_raw = stats.get('volume24h', 0)
-                
-                # Convert to float, handling both string and numeric formats
-                if isinstance(volume_24h_raw, str):
-                    # Remove commas and convert to float
-                    volume_24h = float(volume_24h_raw.replace(',', ''))
-                else:
-                    volume_24h = float(volume_24h_raw)
                 
                 # Get open interest with similar handling
                 open_interest_raw = stats.get('openInterest', 0)
@@ -192,12 +230,26 @@ def fetch_all_markets():
                 else:
                     open_interest = float(open_interest_raw)
                 
+                # Get volume based on chosen method
+                if volume_method == "Orderbook-based":
+                    volume_24h = estimate_volume_from_orderbook(coin, price)
+                else:
+                    # Original method: use API stats
+                    volume_24h_raw = stats.get('volume24h', 0)
+                    
+                    # Convert to float, handling both string and numeric formats
+                    if isinstance(volume_24h_raw, str):
+                        # Remove commas and convert to float
+                        volume_24h = float(volume_24h_raw.replace(',', ''))
+                    else:
+                        volume_24h = float(volume_24h_raw)
+                
                 # For debugging
-                if coin in ['BTC-USD', 'ETH-USD', 'SOL-USD', 'SUI-USD']:
+                if coin in ['BTC', 'ETH', 'SOL', 'SUI']:
                     skipped_markets.append({
                         'symbol': coin,
                         'volume24h': volume_24h,
-                        'raw_volume': volume_24h_raw,
+                        'estimation_method': volume_method,
                         'min_required': MIN_LIQUIDITY
                     })
                 
@@ -206,7 +258,7 @@ def fetch_all_markets():
                     skipped_markets.append({
                         'symbol': coin,
                         'volume24h': volume_24h,
-                        'raw_volume': volume_24h_raw,
+                        'estimation_method': volume_method,
                         'min_required': MIN_LIQUIDITY
                     })
                     continue
@@ -241,6 +293,8 @@ def fetch_all_markets():
         if df.empty:
             if skipped_markets:
                 st.warning(f"All {len(skipped_markets)} markets were skipped due to liquidity threshold. Consider lowering the minimum liquidity.")
+                if len(skipped_markets) > 0:
+                    st.info(f"Sample skipped market: {skipped_markets[0]}")
             return df
         
         # Only calculate 24h change for top markets to avoid timeout
@@ -312,23 +366,35 @@ with st.sidebar:
     BASE_VOL = st.slider("Base Volume Threshold", 0.1, 2.0, 0.35, 0.05)
     VOL_MULTIPLIER = st.slider("Volume Multiplier", 1.0, 3.0, 1.5, 0.1)
     
-    # Updated MIN_LIQUIDITY with lower options
+    # Updated MIN_LIQUIDITY with LOWER options
     liquidity_options = {
+        "10,000 USD": 10000,
+        "25,000 USD": 25000,
+        "50,000 USD": 50000,
         "100,000 USD": 100000,
         "200,000 USD": 200000,
-        "300,000 USD": 300000,
         "500,000 USD": 500000,
-        "1,000,000 USD": 1000000,
-        "5,000,000 USD": 5000000
+        "1,000,000 USD": 1000000
     }
     
     selected_liquidity = st.selectbox(
         "Minimum Liquidity",
         options=list(liquidity_options.keys()),
-        index=0  # Default to 100,000
+        index=2  # Default to 50,000
     )
     
     MIN_LIQUIDITY = liquidity_options[selected_liquidity]
+    
+    # Volume estimation method
+    volume_method = st.radio(
+        "Volume Estimation Method",
+        ["Orderbook-based", "API Stats"],
+        index=0,
+        help="Orderbook-based estimation may find more markets but could be less precise"
+    )
+    
+    # Store method in session state
+    st.session_state.volume_method = volume_method
     
     FUNDING_THRESHOLD = st.slider("Funding Rate Threshold (basis points)", 10, 200, 60, 5)
 
@@ -591,7 +657,7 @@ def scan_markets():
     
     # First, fetch the raw market data
     try:
-        with st.spinner("Fetching market data..."):
+        with st.spinner(f"Fetching market data using {st.session_state.volume_method} method..."):
             markets_df = fetch_all_markets()
             
             if markets_df.empty:
@@ -602,13 +668,19 @@ def scan_markets():
                         skipped = debug['skipped_markets']
                         sample_market = skipped[0] if skipped else {}
                         st.warning(f"Found data but all markets were below the liquidity threshold. Sample: {sample_market}")
+                        
+                        # Suggest lowering the threshold
+                        current_threshold = MIN_LIQUIDITY
+                        if current_threshold > 10000:  # If not already at lowest
+                            lower_threshold = current_threshold / 2
+                            st.info(f"Try lowering the minimum liquidity threshold to {lower_threshold:,.0f} USD")
                     else:
                         st.error("No market data found. Check API connection.")
                 return
                 
             # Store markets in session state
             st.session_state.scanned_markets = markets_df
-            st.success(f"Found {len(markets_df)} markets meeting the minimum liquidity threshold.")
+            st.success(f"Found {len(markets_df)} markets meeting the minimum liquidity threshold of ${MIN_LIQUIDITY:,} USD.")
     
     except Exception as e:
         st.error(f"Error during market scan: {str(e)}")
@@ -640,7 +712,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Market Scanner", "Active Trades",
 # Tab 1: Market Scanner
 with tab1:
     # Display current liquidity setting
-    st.info(f"Current Minimum Liquidity: ${MIN_LIQUIDITY:,} USD")
+    st.info(f"Current Minimum Liquidity: ${MIN_LIQUIDITY:,} USD using {st.session_state.volume_method} volume estimation")
     
     if st.button("Scan Markets", use_container_width=True):
         scan_markets()
@@ -930,6 +1002,23 @@ with tab6:
                 st.json(meta_response.json()[:2])  # Show first 2 items
         except Exception as e:
             st.error(f"API connection test failed: {str(e)}")
+            
+    # Test orderbook API
+    if st.button("Test Orderbook API"):
+        try:
+            response = requests.post(HYPERLIQUID_INFO_API, json={"type": "l2Book", "coin": "BTC"})
+            st.write(f"Orderbook API Status: {response.status_code}")
+            if response.status_code == 200:
+                data = response.json()
+                if 'asks' in data and 'bids' in data:
+                    st.success("Successfully retrieved orderbook data")
+                    # Show some sample data
+                    st.write("Sample asks:", data['asks'][:3] if data['asks'] else [])
+                    st.write("Sample bids:", data['bids'][:3] if data['bids'] else [])
+                else:
+                    st.warning("Orderbook API response missing asks or bids")
+        except Exception as e:
+            st.error(f"Orderbook API test failed: {str(e)}")
     
     # Show debug info if available
     if st.session_state.debug_info:
