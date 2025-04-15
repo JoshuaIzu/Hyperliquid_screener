@@ -8,7 +8,6 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 import sqlite3
-import requests
 import time
 
 # Set page config
@@ -22,15 +21,22 @@ st.set_page_config(
 st.title("📈 Hyperliquid Futures Market Screener")
 st.markdown("Track and analyze cryptocurrency futures markets on Hyperliquid")
 
-# Hyperliquid API Endpoints
-HYPERLIQUID_INFO_API = "https://api.hyperliquid.xyz/info"
-HYPERLIQUID_EXCHANGE_API = "https://api.hyperliquid.xyz/exchange"
-
 # Configuration
 BASE_VOL = 0.35
 VOL_MULTIPLIER = 1.5
 MIN_LIQUIDITY = 50000  # Lower default to 50k
 FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
+
+# Initialize CCXT exchange instance
+@st.cache_resource
+def init_exchange():
+    return ccxt.hyperliquid({
+        'enableRateLimit': True,  # Respect API rate limits
+        'options': {'defaultType': 'swap'}  # Focus on perpetual futures
+    })
+
+# Initialize the exchange
+exchange = init_exchange()
 
 # Initialize session state if not already present
 if 'signals' not in st.session_state:
@@ -85,210 +91,131 @@ def save_state_to_db(active_trades, completed_trades):
     conn.commit()
     conn.close()
 
-# Hyperliquid API Functions
-@st.cache_data(ttl=30)
-def fetch_hyperliquid_meta():
-    """Fetch metadata about available markets on Hyperliquid"""
-    try:
-        response = requests.post(HYPERLIQUID_INFO_API, json={"type": "meta"})
-        data = response.json()
-        return data
-    except Exception as e:
-        st.error(f"Error fetching metadata: {str(e)}")
-        return None
-
-def parse_number_string(value):
-    """Parse a number from API that could be a string with commas, scientific notation, or a float"""
+# Helper function to safely parse numbers
+def safe_float(value, default=0.0):
+    """Safely convert a value to float"""
     if value is None:
-        return 0.0
-        
-    if isinstance(value, (int, float)):
+        return default
+    try:
         return float(value)
-        
-    if isinstance(value, str):
-        # Remove commas
-        value = value.replace(',', '')
-        
-        try:
-            # Try to convert to float
-            return float(value)
-        except ValueError:
-            # If it fails (perhaps due to scientific notation or other format)
-            try:
-                # Try scientific notation
-                return float(value)
-            except ValueError:
-                return 0.0
-    
-    return 0.0
+    except (ValueError, TypeError):
+        return default
 
 @st.cache_data(ttl=60)
 def fetch_all_markets():
-    """Fetch all perpetual contracts from Hyperliquid with comprehensive market data"""
+    """Fetch all perpetual contracts from Hyperliquid with comprehensive market data using CCXT"""
     try:
-        # Store debug information
         debug_info = {}
         
-        # Start with fetching the metadata to get the list of available coins
-        meta_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "meta"})
+        # Load all markets
+        markets = exchange.load_markets()
+        debug_info['total_markets'] = len(markets)
         
-        if meta_response.status_code != 200:
-            st.error(f"Meta API request failed with status {meta_response.status_code}")
-            return pd.DataFrame()
-            
-        meta_data = meta_response.json()
-        debug_info['meta_data'] = str(type(meta_data))[:100]  # Just store the type to avoid large objects
+        # Filter for perpetual contracts only
+        perp_markets = {symbol: market for symbol, market in markets.items() 
+                       if market['type'] == 'swap' and not market['spot']}
+        debug_info['perpetual_markets'] = len(perp_markets)
         
-        # Extract coins from universe list
-        coins = []
-        if 'universe' in meta_data and isinstance(meta_data['universe'], list):
-            coins = [asset['name'] for asset in meta_data['universe'] if isinstance(asset, dict) and 'name' in asset]
+        # Fetch tickers for all markets to get prices and volumes
+        tickers = exchange.fetch_tickers(list(perp_markets.keys()))
+        debug_info['tickers_fetched'] = len(tickers)
         
-        if not coins:
-            st.error("No coins found in meta data")
-            return pd.DataFrame()
+        # Fetch funding rates
+        try:
+            funding_rates = exchange.fetch_funding_rates()
+            debug_info['funding_rates_fetched'] = len(funding_rates)
+        except Exception as e:
+            debug_info['funding_error'] = str(e)
+            funding_rates = {}
         
-        debug_info['coins'] = coins[:5]  # Store first 5 coins for debugging
-        debug_info['total_coins'] = len(coins)
-        
-        # Get all stats
-        stats_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "stats"})
-        stats_data = {}
-        debug_info['stats_response_code'] = stats_response.status_code
-        
-        if stats_response.status_code == 200:
-            stats_result = stats_response.json()
-            debug_info['stats_result_type'] = str(type(stats_result))
-            
-            # Store the raw JSON for the first few coins to debug parsing issues
-            if isinstance(stats_result, list) and len(stats_result) > 0:
-                debug_info['stats_sample'] = stats_result[:2]
-                
-                for stat in stats_result:
-                    if isinstance(stat, dict) and 'coin' in stat:
-                        stats_data[stat['coin']] = stat
-        
-        # Get all prices
-        prices_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "oracle"})
-        prices_data = {}
-        debug_info['prices_response_code'] = prices_response.status_code
-        
-        if prices_response.status_code == 200:
-            prices_result = prices_response.json()
-            
-            if isinstance(prices_result, list):
-                for price in prices_result:
-                    if isinstance(price, dict) and 'coin' in price and 'price' in price:
-                        prices_data[price['coin']] = parse_number_string(price['price'])
-
-        # Get funding rates
-        funding_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "funding"})
-        funding_data = {}
-        
-        if funding_response.status_code == 200:
-            funding_result = funding_response.json()
-            if isinstance(funding_result, list):
-                for item in funding_result:
-                    if isinstance(item, dict) and 'coin' in item and 'funding' in item:
-                        # Convert funding rate to annualized basis points
-                        funding_data[item['coin']] = parse_number_string(item['funding']) * 10000 * 365 * 24
-
-        # Process market data for each coin
-        markets = []
+        # Process market data
+        market_data = []
         skipped_markets = []
         
-        for coin in coins:
+        for symbol, market in perp_markets.items():
             try:
-                # Get price
-                price = prices_data.get(coin, 0)
+                ticker = tickers.get(symbol, {})
+                base_currency = market['base']
                 
-                # Skip coins without price data
-                if price <= 0:
+                # Skip markets without valid ticker data
+                if not ticker or 'last' not in ticker or not ticker['last']:
                     skipped_markets.append({
-                        'symbol': coin,
+                        'symbol': symbol,
                         'reason': 'No price data',
                         'min_required': MIN_LIQUIDITY
                     })
                     continue
                 
-                # Get stats for this coin
-                stats = stats_data.get(coin, {})
+                price = ticker['last']
+                volume_24h = safe_float(ticker.get('quoteVolume', 0))
                 
-                # Get volume and properly parse it
-                volume_24h_raw = stats.get('volume24h', 0)
-                volume_24h = parse_number_string(volume_24h_raw)
+                # Get funding rate
+                funding_rate = 0
+                if symbol in funding_rates and funding_rates[symbol] and 'fundingRate' in funding_rates[symbol]:
+                    # Convert to annualized basis points (assuming 8h funding periods)
+                    funding_rate = safe_float(funding_rates[symbol]['fundingRate']) * 10000 * 3 * 365
                 
-                # Get open interest
-                open_interest_raw = stats.get('openInterest', 0)
-                open_interest = parse_number_string(open_interest_raw)
+                # Get open interest using CCXT
+                open_interest = 0
+                try:
+                    oi_data = exchange.fetch_open_interest(symbol)
+                    if oi_data and 'openInterestAmount' in oi_data:
+                        open_interest = safe_float(oi_data['openInterestAmount']) * price
+                except Exception as e:
+                    debug_info[f'oi_error_{symbol}'] = str(e)
                 
-                # Store info for debugging specific coins
-                if coin in ['BTC', 'ETH', 'SOL']:
-                    debug_info[f'{coin}_details'] = {
+                # Store special coins for debugging
+                if base_currency in ['BTC', 'ETH', 'SOL']:
+                    debug_info[f'{base_currency}_details'] = {
+                        'symbol': symbol,
                         'price': price,
-                        'volume_raw': volume_24h_raw,
-                        'volume_parsed': volume_24h,
-                        'oi_raw': open_interest_raw,
-                        'oi_parsed': open_interest,
-                        'min_required': MIN_LIQUIDITY
+                        'volume': volume_24h,
+                        'open_interest': open_interest,
+                        'funding_rate': funding_rate
                     }
                 
-                # Skip low liquidity markets
+                # Skip if below liquidity threshold
                 if volume_24h < MIN_LIQUIDITY:
                     skipped_markets.append({
-                        'symbol': coin,
+                        'symbol': symbol,
                         'volume24h': volume_24h,
-                        'raw_volume': volume_24h_raw,
                         'min_required': MIN_LIQUIDITY
                     })
                     continue
                 
-                # Get funding rate
-                funding_rate = funding_data.get(coin, 0)
+                # Calculate price change if available
+                change_24h = safe_float(ticker.get('percentage', 0))
                 
-                markets.append({
-                    'symbol': coin,
+                market_data.append({
+                    'symbol': base_currency,         # Use base currency as symbol for simplicity
+                    'full_symbol': symbol,          # Keep full exchange symbol as reference
                     'markPrice': price,
                     'lastPrice': price,
                     'fundingRate': funding_rate,
                     'openInterest': open_interest,
                     'volume24h': volume_24h,
-                    'change24h': 0,  # Will be calculated from candles
+                    'change24h': change_24h,
                     'liquidityScore': volume_24h / open_interest if open_interest > 0 else 0
                 })
                 
             except Exception as e:
-                debug_info[f'error_{coin}'] = str(e)
+                debug_info[f'error_{symbol}'] = str(e)
                 continue
         
-        # Create DataFrame with all market data
-        df = pd.DataFrame(markets)
+        # Create DataFrame and sort by volume
+        df = pd.DataFrame(market_data)
         
         # Save debug info
-        debug_info['markets_count'] = len(markets)
-        debug_info['skipped_count'] = len(skipped_markets)
-        debug_info['skipped_markets'] = skipped_markets[:5]  # Show first 5 for brevity
+        debug_info['markets_processed'] = len(market_data)
+        debug_info['markets_skipped'] = len(skipped_markets)
+        debug_info['skipped_samples'] = skipped_markets[:5]  # Just show first 5
         st.session_state.debug_info = debug_info
         
         if df.empty:
             if skipped_markets:
                 st.warning(f"All {len(skipped_markets)} markets were skipped due to liquidity threshold. Consider lowering the minimum liquidity.")
             return df
-        
-        # Only calculate 24h change for top markets to avoid timeout
-        for symbol in df['symbol'].head(5):
-            try:
-                candles = fetch_hyperliquid_candles(symbol, interval='1d', limit=2)
-                if candles is not None and len(candles) >= 2:
-                    prev_close = candles.iloc[-2]['close']
-                    current_close = candles.iloc[-1]['close']
-                    df.loc[df['symbol'] == symbol, 'change24h'] = (
-                        (current_close - prev_close) / prev_close * 100
-                    )
-            except Exception as e:
-                # Just skip if we can't get change data
-                continue
-        
+            
         return df.sort_values('volume24h', ascending=False)
         
     except Exception as e:
@@ -297,85 +224,75 @@ def fetch_all_markets():
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
-def fetch_hyperliquid_candles(coin, interval="1h", limit=50):
-    """Fetch OHLCV data for a specific coin"""
+def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
+    """Fetch OHLCV data for a specific symbol using CCXT"""
     try:
-        now = int(time.time())
-        # Convert limit to appropriate time range based on interval
-        if interval == "1h":
-            start_time = now - (limit * 3600)
-        elif interval == "4h":
-            start_time = now - (limit * 3600 * 4)
-        elif interval == "1d":
-            start_time = now - (limit * 3600 * 24)
-        else:
-            start_time = now - (limit * 3600)  # Default to hourly
+        # Map interval string to CCXT timeframe
+        timeframe_map = {
+            '1h': '1h',
+            '4h': '4h',
+            '1d': '1d'
+        }
+        timeframe = timeframe_map.get(interval, '1h')
+        
+        # Need to find the full symbol for the coin
+        markets = exchange.load_markets()
+        full_symbol = None
+        
+        # Find the corresponding full symbol
+        for sym in markets:
+            if markets[sym]['type'] == 'swap' and markets[sym]['base'] == symbol:
+                full_symbol = sym
+                break
+        
+        if not full_symbol:
+            st.warning(f"Could not find full symbol for {symbol}")
+            return None
+        
+        # Fetch OHLCV data
+        ohlcv = exchange.fetch_ohlcv(full_symbol, timeframe, limit=limit)
+        
+        if not ohlcv or len(ohlcv) == 0:
+            return None
             
-        response = requests.post(
-            HYPERLIQUID_INFO_API, 
-            json={
-                "type": "candleSnapshot",
-                "coin": coin,
-                "interval": interval,
-                "startTime": start_time,
-                "endTime": now
-            }
-        )
-        data = response.json()
-        
         # Convert to DataFrame
-        if data and len(data) > 0:
-            df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-            df['open'] = df['open'].astype(float)
-            df['high'] = df['high'].astype(float)
-            df['low'] = df['low'].astype(float)
-            df['close'] = df['close'].astype(float)
-            df['volume'] = df['volume'].astype(float)
-            return df
-        return None
-    except Exception as e:
-        st.error(f"Error fetching candles for {coin}: {str(e)}")
-        return None
-
-# Fallback orderbook-based volume estimation
-def estimate_volume_from_orderbook(coin, price):
-    """Estimate 24h volume from orderbook liquidity"""
-    try:
-        # Get orderbook data
-        response = requests.post(HYPERLIQUID_INFO_API, json={"type": "l2Book", "coin": coin})
-        if response.status_code != 200:
-            return 0
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
-        orderbook = response.json()
-        if not orderbook:
-            return 0
+        return df
+    except Exception as e:
+        st.error(f"Error fetching candles for {symbol}: {str(e)}")
+        return None
 
+# Alternative method if orderbook is needed
+def estimate_volume_from_orderbook(symbol, price):
+    """Estimate 24h volume from orderbook liquidity using CCXT"""
+    try:
+        # Find the full symbol
+        markets = exchange.load_markets()
+        full_symbol = None
+        
+        for sym in markets:
+            if markets[sym]['type'] == 'swap' and markets[sym]['base'] == symbol:
+                full_symbol = sym
+                break
+        
+        if not full_symbol:
+            return 0
+            
+        # Fetch order book
+        orderbook = exchange.fetch_order_book(full_symbol)
+        
         asks = orderbook.get('asks', [])
         bids = orderbook.get('bids', [])
-
-        # Calculate liquidity within 2% of mid price
-        liquid_asks = [
-            [float(level[0]), float(level[1])]
-            for level in asks 
-            if float(level[0]) <= price * 1.02
-        ]
         
-        liquid_bids = [
-            [float(level[0]), float(level[1])]
-            for level in bids
-            if float(level[0]) >= price * 0.98
-        ]
+        # Calculate liquidity within 2% of price
+        ask_liquidity = sum(price * amount for price, amount in asks if price <= price * 1.02)
+        bid_liquidity = sum(price * amount for price, amount in bids if price >= price * 0.98)
         
-        # Sum up the liquidity (size * price) within threshold
-        ask_liquidity = sum(level[0] * level[1] for level in liquid_asks)
-        bid_liquidity = sum(level[0] * level[1] for level in liquid_bids)
+        # Estimate 24h volume as liquidity * turnover factor
+        return (ask_liquidity + bid_liquidity) * 4
         
-        # Estimate volume as total liquidity * typical daily turnover (4x)
-        volume_24h = (ask_liquidity + bid_liquidity) * 4
-        
-        return volume_24h
-
     except Exception as e:
         return 0
 
@@ -399,7 +316,7 @@ with st.sidebar:
     selected_liquidity = st.selectbox(
         "Minimum Liquidity",
         options=list(liquidity_options.keys()),
-        index=2  # Default to 25,000
+        index=1  # Default to 10,000 (lower default)
     )
     
     MIN_LIQUIDITY = liquidity_options[selected_liquidity]
@@ -414,7 +331,7 @@ with st.sidebar:
         
         fallback_threshold = st.number_input(
             "Fallback threshold (USD)",
-            value=10000.0,
+            value=5000.0,
             min_value=1000.0,
             step=1000.0,
             help="Volume threshold below which orderbook fallback will be used"
@@ -476,46 +393,48 @@ class ForwardTester:
         
         # Get current prices for all coins
         markets_df = fetch_all_markets()
-        prices_dict = {row['symbol']: row['markPrice'] for _, row in markets_df.iterrows()} if not markets_df.empty else {}
-        
-        for symbol, trade in self.active_trades.items():
-            try:
-                current_price = prices_dict.get(symbol)
-                if not current_price:
-                    continue
-                    
-                entry_price = trade['entry_price']
-                
-                # Check for TP/SL
-                if trade['direction'] == "LONG":
-                    if trade['tp_price'] and current_price >= trade['tp_price']:
-                        trade['exit_reason'] = "TP Hit"
-                    elif trade['sl_price'] and current_price <= trade['sl_price']:
-                        trade['exit_reason'] = "SL Hit"
-                elif trade['direction'] == "SHORT":
-                    if trade['tp_price'] and current_price <= trade['tp_price']:
-                        trade['exit_reason'] = "TP Hit"
-                    elif trade['sl_price'] and current_price >= trade['sl_price']:
-                        trade['exit_reason'] = "SL Hit"
-                
-                # Mark for removal if closed
-                if 'exit_reason' in trade:
-                    trade['exit_price'] = current_price
-                    trade['exit_time'] = datetime.now().isoformat()
-                    trade['status'] = 'CLOSED'
-                    trade['pct_change'] = ((current_price - entry_price)/entry_price)*100 if trade['direction'] == "LONG" else ((entry_price - current_price)/entry_price)*100
-                    self.completed_trades.append(trade)
-                    to_remove.append(symbol)
-                    updates.append(f"✅ Trade closed: {symbol} | Reason: {trade['exit_reason']} | PnL: {trade['pct_change']:.2f}%")
+        if not markets_df.empty:
+            prices_dict = {row['symbol']: row['markPrice'] for _, row in markets_df.iterrows()}
             
-            except Exception as e:
-                updates.append(f"Error updating {symbol}: {str(e)}")
+            for symbol, trade in self.active_trades.items():
+                try:
+                    current_price = prices_dict.get(symbol)
+                    if not current_price:
+                        continue
+                        
+                    entry_price = trade['entry_price']
+                    
+                    # Check for TP/SL
+                    if trade['direction'] == "LONG":
+                        if trade['tp_price'] and current_price >= trade['tp_price']:
+                            trade['exit_reason'] = "TP Hit"
+                        elif trade['sl_price'] and current_price <= trade['sl_price']:
+                            trade['exit_reason'] = "SL Hit"
+                    elif trade['direction'] == "SHORT":
+                        if trade['tp_price'] and current_price <= trade['tp_price']:
+                            trade['exit_reason'] = "TP Hit"
+                        elif trade['sl_price'] and current_price >= trade['sl_price']:
+                            trade['exit_reason'] = "SL Hit"
+                    
+                    # Mark for removal if closed
+                    if 'exit_reason' in trade:
+                        trade['exit_price'] = current_price
+                        trade['exit_time'] = datetime.now().isoformat()
+                        trade['status'] = 'CLOSED'
+                        trade['pct_change'] = ((current_price - entry_price)/entry_price)*100 if trade['direction'] == "LONG" else ((entry_price - current_price)/entry_price)*100
+                        self.completed_trades.append(trade)
+                        to_remove.append(symbol)
+                        updates.append(f"✅ Trade closed: {symbol} | Reason: {trade['exit_reason']} | PnL: {trade['pct_change']:.2f}%")
+                
+                except Exception as e:
+                    updates.append(f"Error updating {symbol}: {str(e)}")
+            
+            # Remove closed trades
+            for symbol in to_remove:
+                self.active_trades.pop(symbol)
+            
+            self.save_state()
         
-        # Remove closed trades
-        for symbol in to_remove:
-            self.active_trades.pop(symbol)
-        
-        self.save_state()
         return updates
     
     def get_performance_report(self):
@@ -587,7 +506,6 @@ def generate_signals(markets_df):
     signals = []
     
     # Limit analysis to top markets by volume to avoid timeout
-    # Use a smaller number if you're experiencing timeouts
     max_markets = 15
     top_markets = markets_df.head(max_markets)
     total_markets = len(top_markets)
@@ -681,30 +599,24 @@ def scan_markets():
     
     # First, fetch the raw market data
     try:
-        with st.spinner("Fetching market data..."):
+        with st.spinner("Fetching market data using CCXT..."):
             markets_df = fetch_all_markets()
             
             if markets_df.empty:
                 # Check debug info for clues
                 if 'debug_info' in st.session_state:
                     debug = st.session_state.debug_info
-                    if 'skipped_markets' in debug and debug['skipped_markets']:
-                        skipped = debug['skipped_markets']
+                    if 'skipped_samples' in debug and debug['skipped_samples']:
+                        skipped = debug['skipped_samples']
                         sample_market = skipped[0] if skipped else {}
-                        st.warning(f"Found data but all markets were below the liquidity threshold. Sample: {sample_market}")
+                        st.warning(f"Found data but all markets were below the liquidity threshold. Consider lowering the threshold.")
                         
                         # Show debugging info
                         if 'BTC_details' in debug:
                             st.info("Debug info for BTC:")
                             st.json(debug['BTC_details'])
-                        
-                        # Suggest lowering the threshold
-                        current_threshold = MIN_LIQUIDITY
-                        if current_threshold > 5000:  # If not already at lowest
-                            lower_threshold = current_threshold / 2
-                            st.info(f"Try lowering the minimum liquidity threshold to {lower_threshold:,.0f} USD")
                     else:
-                        st.error("No market data found. Check API connection.")
+                        st.error("No market data found. Check CCXT connection.")
                 return
                 
             # Store markets in session state
@@ -844,7 +756,7 @@ with tab2:
         
         if selected_trade:
             timeframe = st.selectbox("Timeframe", ['1h', '4h', '1d'], index=0)
-            ohlcv_df = fetch_hyperliquid_candles(selected_trade, interval=timeframe, limit=50)  # Reduced from 100
+            ohlcv_df = fetch_hyperliquid_candles(selected_trade, interval=timeframe, limit=50)
             
             if ohlcv_df is not None:
                 # Create candlestick chart
@@ -1014,72 +926,70 @@ with tab5:
 with tab6:
     st.header("Debug Information")
     
-    st.subheader("API Connection Status")
+    # CCXT Exchange Info
+    st.subheader("CCXT Exchange Info")
     
-    # Test API connection button
-    if st.button("Test API Connection"):
+    # Test CCXT connection
+    if st.button("Test CCXT Connection"):
         try:
-            meta_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "meta"})
-            stats_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "stats"})
-            oracle_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "oracle"})
+            # Get exchange status
+            version = exchange.version if hasattr(exchange, 'version') else 'Unknown'
+            has_features = ', '.join([f for f, v in exchange.has.items() if v])
             
-            st.success(f"Meta API: {meta_response.status_code}")
-            st.success(f"Stats API: {stats_response.status_code}")
-            st.success(f"Oracle API: {oracle_response.status_code}")
+            st.success(f"CCXT Hyperliquid connection established")
+            st.write(f"CCXT Version: {version}")
             
-            if meta_response.status_code == 200:
-                st.write("Meta Data Sample:")
-                meta_json = meta_response.json()
-                if 'universe' in meta_json and len(meta_json['universe']) > 0:
-                    st.json(meta_json['universe'][0])
+            # Test loading markets
+            markets = exchange.load_markets()
+            perp_markets = {k: v for k, v in markets.items() if v.get('type') == 'swap'}
             
-            if stats_response.status_code == 200:
-                st.write("Stats Data Sample:")
-                stats_json = stats_response.json()
-                if isinstance(stats_json, list) and len(stats_json) > 0:
-                    st.json(stats_json[0])
+            st.write(f"Total markets: {len(markets)}")
+            st.write(f"Perpetual markets: {len(perp_markets)}")
             
-            if oracle_response.status_code == 200:
-                st.write("Oracle Data Sample:")
-                oracle_json = oracle_response.json()
-                if isinstance(oracle_json, list) and len(oracle_json) > 0:
-                    st.json(oracle_json[0])
+            # Show sample market details
+            if perp_markets:
+                sample_symbol = list(perp_markets.keys())[0]
+                st.write(f"Sample market: {sample_symbol}")
+                st.json(perp_markets[sample_symbol])
+            
+            # Test fetching a ticker
+            if perp_markets:
+                sample_symbol = list(perp_markets.keys())[0]
+                ticker = exchange.fetch_ticker(sample_symbol)
+                st.write(f"Ticker data for {sample_symbol}:")
+                st.json({k: v for k, v in ticker.items() if k in ['last', 'bid', 'ask', 'quoteVolume', 'baseVolume']})
+        
         except Exception as e:
-            st.error(f"API connection test failed: {str(e)}")
+            st.error(f"CCXT connection test failed: {str(e)}")
     
-    # Show debug info if available
+    # Show debug info
     if st.session_state.debug_info:
         st.subheader("Last Scan Debug Info")
         
-        # Show important debug information first
+        # Show key metrics
+        cols = st.columns(3)
+        with cols[0]:
+            st.metric("Total Markets", 
+                      st.session_state.debug_info.get('total_markets', 'N/A'))
+        with cols[1]:
+            st.metric("Markets Processed", 
+                      st.session_state.debug_info.get('markets_processed', 'N/A'))
+        with cols[2]:
+            st.metric("Markets Skipped", 
+                      st.session_state.debug_info.get('markets_skipped', 'N/A'))
+        
+        # Show BTC details if available
         if 'BTC_details' in st.session_state.debug_info:
-            st.write("BTC Market Details:")
+            st.subheader("BTC Market Details")
             st.json(st.session_state.debug_info['BTC_details'])
         
-        # Markets summary
-        if 'markets_count' in st.session_state.debug_info:
-            st.write(f"Markets found: {st.session_state.debug_info['markets_count']}")
-            st.write(f"Markets skipped: {st.session_state.debug_info['skipped_count']}")
-        
-        # Show sample skipped markets
-        if 'skipped_markets' in st.session_state.debug_info and st.session_state.debug_info['skipped_markets']:
+        # Show skipped markets sample
+        if 'skipped_samples' in st.session_state.debug_info and st.session_state.debug_info['skipped_samples']:
             st.subheader("Sample Skipped Markets")
-            skipped_df = pd.DataFrame(st.session_state.debug_info['skipped_markets'])
-            st.dataframe(skipped_df)
-        
-        # Test parse_number_string function
-        st.subheader("Test Number Parsing")
-        test_values = ["1,234,567", "1.23e6", "123456", 123456, None]
-        
-        for val in test_values:
-            try:
-                result = parse_number_string(val)
-                st.write(f"Input: {type(val)} {val} → Output: {result}")
-            except Exception as e:
-                st.write(f"Input: {type(val)} {val} → Error: {str(e)}")
-        
+            st.json(st.session_state.debug_info['skipped_samples'])
+            
         # Show any errors
-        errors = {k: v for k, v in st.session_state.debug_info.items() if k.startswith('error')}
+        errors = {k: v for k, v in st.session_state.debug_info.items() if 'error' in k.lower()}
         if errors:
             st.subheader("Errors")
             for k, v in errors.items():
