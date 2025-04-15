@@ -183,9 +183,12 @@ def fetch_all_markets():
         
         if df.empty:
             return df
-            
-        # Calculate 24h change from candles for each market
-        for symbol in df['symbol']:
+        
+        # Limited batch processing for candles to avoid timeout
+        # Only process first 10 markets for 24h change to avoid timeout
+        top_markets = df.head(10)
+        
+        for symbol in top_markets['symbol']:
             try:
                 candles = fetch_hyperliquid_candles(symbol, interval='1d', limit=2)
                 if candles is not None and len(candles) >= 2:
@@ -205,7 +208,7 @@ def fetch_all_markets():
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
-def fetch_hyperliquid_candles(coin, interval="1h", limit=500):
+def fetch_hyperliquid_candles(coin, interval="1h", limit=100):  # Reduced default limit
     """Fetch OHLCV data for a specific coin"""
     try:
         now = int(time.time())
@@ -246,6 +249,12 @@ def fetch_hyperliquid_candles(coin, interval="1h", limit=500):
         st.error(f"Error fetching candles for {coin}: {str(e)}")
         return None
 
+# Initialize session state if not already present
+if 'signals' not in st.session_state:
+    st.session_state.signals = []
+if 'scanned_markets' not in st.session_state:
+    st.session_state.scanned_markets = pd.DataFrame()
+
 # Sidebar for parameters
 with st.sidebar:
     st.header("Parameters")
@@ -265,7 +274,7 @@ with st.sidebar:
     selected_liquidity = st.selectbox(
         "Minimum Liquidity",
         options=list(liquidity_options.keys()),
-        index=3  # Default to 500,000
+        index=0  # Default to 100,000
     )
     
     MIN_LIQUIDITY = liquidity_options[selected_liquidity]
@@ -428,23 +437,30 @@ def init_market_cache():
 # Initialize cache tables
 init_market_cache()
 
-# Function to analyze and generate signals
-def generate_signals(markets_df=None):
+# Modified function to analyze and generate signals without timing out
+def generate_signals(markets_df):
     """Generate trading signals based on volume analysis and funding rates"""
     if markets_df is None or markets_df.empty:
-        markets_df = fetch_all_markets()
+        return []
     
     signals = []
+    
+    # Limit processing to top 20 markets by volume to avoid timeout
+    top_markets = markets_df.head(20)
+    total_markets = len(top_markets)
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    for i, (index, market) in enumerate(markets_df.iterrows()):
+    for i, (index, market) in enumerate(top_markets.iterrows()):
         symbol = market['symbol']
-        status_text.text(f"Analyzing {symbol}...")
+        status_text.text(f"Analyzing {symbol}... ({i+1}/{total_markets})")
         
-        # Fetch hourly data
-        df = fetch_hyperliquid_candles(symbol, interval='1h', limit=168)  # 7 days
+        progress_value = (i + 1) / total_markets
+        progress_bar.progress(progress_value)
+        
+        # Fetch hourly data - limited to 48 hours instead of 168 to reduce processing time
+        df = fetch_hyperliquid_candles(symbol, interval='1h', limit=48) 
         if df is None or len(df) < 24:
             continue
             
@@ -507,13 +523,34 @@ def generate_signals(markets_df=None):
             'SL': sl
         })
         
-        # Update progress
-        progress_bar.progress((i + 1) / len(markets_df))
-    
     progress_bar.empty()
     status_text.empty()
     
     return signals
+
+# Function to fetch markets and store them in session state
+def scan_markets():
+    # First display all markets before signal analysis to improve UX
+    with st.spinner("Fetching markets data..."):
+        markets_df = fetch_all_markets()
+        st.session_state.scanned_markets = markets_df
+        
+        if markets_df.empty:
+            st.error("No markets found meeting current liquidity threshold. Try lowering the minimum liquidity.")
+            return
+            
+        st.success(f"Found {len(markets_df)} markets meeting the liquidity threshold.")
+        
+    # Now generate trading signals based on the markets
+    with st.spinner("Analyzing markets for trading signals..."):
+        signals = generate_signals(markets_df)
+        st.session_state.signals = signals
+        
+        if not signals:
+            st.warning("No trading signals found with the current parameters.")
+            return
+            
+        st.success(f"Analysis complete. Found {len([s for s in signals if s['Signal'] != 'HOLD'])} actionable signals.")
 
 # Initialize the forward tester
 tester = ForwardTester()
@@ -526,30 +563,63 @@ with tab1:
     # Display current liquidity setting
     st.info(f"Current Minimum Liquidity: ${MIN_LIQUIDITY:,} USD")
     
-    if st.button("Scan Markets"):
-        with st.spinner("Scanning all Hyperliquid perpetual markets..."):
-            markets_df = fetch_all_markets()
-            st.session_state.signals = generate_signals(markets_df)
+    col1, col2 = st.columns([1, 3])
     
-    if 'signals' in st.session_state and st.session_state.signals:
+    with col1:
+        if st.button("Scan Markets", use_container_width=True):
+            scan_markets()
+    
+    with col2:
+        # Add debug info to show raw market data
+        if st.session_state.scanned_markets is not None and not st.session_state.scanned_markets.empty:
+            st.success(f"Found {len(st.session_state.scanned_markets)} markets with at least ${MIN_LIQUIDITY:,} liquidity")
+    
+    # Show raw markets data regardless of signal generation
+    if not st.session_state.scanned_markets.empty:
+        st.subheader("All Markets Data")
+        st.dataframe(
+            st.session_state.scanned_markets[['symbol', 'markPrice', 'volume24h', 'openInterest', 'fundingRate', 'change24h']],
+            use_container_width=True,
+            column_config={
+                'markPrice': st.column_config.NumberColumn("Mark Price", format="%.4f"),
+                'volume24h': st.column_config.NumberColumn("24h Volume", format="$%d"),
+                'openInterest': st.column_config.NumberColumn("Open Interest", format="$%d"),
+                'fundingRate': st.column_config.NumberColumn("Funding Rate (bps)", format="%.2f"),
+                'change24h': st.column_config.NumberColumn("24h Change %", format="%.2f%%")
+            }
+        )
+    
+    # Show signals if available
+    if st.session_state.signals:
+        st.subheader("Trading Signals")
         signals_df = pd.DataFrame(st.session_state.signals)
         
         # Filter options
         signal_filter = st.multiselect("Filter by Signal", 
-                                       options=['LONG', 'SHORT', 'HOLD'], 
-                                       default=['LONG', 'SHORT'])
+                                      options=['LONG', 'SHORT', 'HOLD'], 
+                                      default=['LONG', 'SHORT'])
         
-        filtered_df = signals_df[signals_df['Signal'].isin(signal_filter)]
-        
-        # Display signals table
-        st.dataframe(filtered_df, use_container_width=True)
-        
-        # Execute trades button
-        if st.button("Execute Selected Signals"):
+        if signal_filter:
+            filtered_df = signals_df[signals_df['Signal'].isin(signal_filter)]
+            
+            # Display signals table
+            st.dataframe(
+                filtered_df,
+                use_container_width=True,
+                column_config={
+                    'Price': st.column_config.NumberColumn("Price", format="%.4f"),
+                    'Volume 24h': st.column_config.NumberColumn("Volume 24h", format="$%d"),
+                    'Funding Rate': st.column_config.NumberColumn("Funding Rate (bps)", format="%.2f"),
+                    'Vol Surge': st.column_config.NumberColumn("Volume Surge", format="%.2fx")
+                }
+            )
+            
+            # Execute trades button
             actionable_signals = [s for s in st.session_state.signals if s['Signal'] != "HOLD" and s['Signal'] in signal_filter]
-            results = tester.execute_trades(actionable_signals)
-            for result in results:
-                st.success(result)
+            if actionable_signals and st.button("Execute Selected Signals"):
+                results = tester.execute_trades(actionable_signals)
+                for result in results:
+                    st.success(result)
 
 # Tab 2: Active Trades
 with tab2:
@@ -596,7 +666,7 @@ with tab2:
         
         if selected_trade:
             timeframe = st.selectbox("Timeframe", ['1h', '4h', '1d'], index=0)
-            ohlcv_df = fetch_hyperliquid_candles(selected_trade, interval=timeframe, limit=100)
+            ohlcv_df = fetch_hyperliquid_candles(selected_trade, interval=timeframe, limit=50)  # Reduced from 100
             
             if ohlcv_df is not None:
                 # Create candlestick chart
@@ -640,15 +710,18 @@ with tab3:
     st.header("Completed Trades")
     
     # Reset button with confirmation
-    if st.button("Reset All Trades"):
-        if st.checkbox("I confirm I want to reset all trades"):
-            result = tester.reset_all_trades()
-            st.success(result)
+    col1, col2 = st.columns([1,3])
+    with col1:
+        if st.button("Reset All Trades"):
+            with col2:
+                if st.checkbox("I confirm I want to reset all trades"):
+                    result = tester.reset_all_trades()
+                    st.success(result)
     
     # Get completed trades
     stats, completed_df = tester.get_performance_report()
     
-    if len(completed_df) > 0:
+    if isinstance(completed_df, pd.DataFrame) and len(completed_df) > 0:
         # Display completed trades
         st.dataframe(completed_df, use_container_width=True)
         
@@ -678,7 +751,7 @@ with tab4:
         st.dataframe(stats_df, use_container_width=True)
         
         # Show performance charts if we have data
-        if len(completed_df) > 0 and 'pct_change' in completed_df.columns:
+        if isinstance(completed_df, pd.DataFrame) and len(completed_df) > 0 and 'pct_change' in completed_df.columns:
             # Cumulative performance chart
             if 'exit_time' in completed_df.columns:
                 completed_df_sorted = completed_df.sort_values('exit_time')
