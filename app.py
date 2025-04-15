@@ -28,8 +28,16 @@ HYPERLIQUID_EXCHANGE_API = "https://api.hyperliquid.xyz/exchange"
 # Configuration
 BASE_VOL = 0.35
 VOL_MULTIPLIER = 1.5
-MIN_LIQUIDITY = 500000  # Changed default to 500k
+MIN_LIQUIDITY = 100000  # Lowest default to 100k
 FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
+
+# Initialize session state if not already present
+if 'signals' not in st.session_state:
+    st.session_state.signals = []
+if 'scanned_markets' not in st.session_state:
+    st.session_state.scanned_markets = pd.DataFrame()
+if 'debug_info' not in st.session_state:
+    st.session_state.debug_info = {}
 
 # Database functions for state management
 def load_state_from_db():
@@ -88,10 +96,13 @@ def fetch_hyperliquid_meta():
         st.error(f"Error fetching metadata: {str(e)}")
         return None
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid with comprehensive market data"""
     try:
+        # Store debug information
+        debug_info = {}
+        
         # Start with fetching the metadata to get the list of available coins
         meta_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "meta"})
         
@@ -100,6 +111,7 @@ def fetch_all_markets():
             return pd.DataFrame()
             
         meta_data = meta_response.json()
+        debug_info['meta_data'] = meta_data
         
         # Extract coins from universe list
         coins = []
@@ -110,12 +122,17 @@ def fetch_all_markets():
             st.error("No coins found in meta data")
             return pd.DataFrame()
         
+        debug_info['coins'] = coins
+        
         # Get all stats - contains open interest and volume
         stats_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "stats"})
         stats_data = {}
+        debug_info['raw_stats_response'] = stats_response.status_code
         
         if stats_response.status_code == 200:
             stats_result = stats_response.json()
+            debug_info['stats_sample'] = stats_result[:3] if stats_result else []
+            
             for stat in stats_result:
                 if isinstance(stat, dict) and 'coin' in stat:
                     stats_data[stat['coin']] = stat
@@ -123,9 +140,12 @@ def fetch_all_markets():
         # Get all prices using the oracle endpoint
         prices_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "oracle"})
         prices_data = {}
+        debug_info['prices_response'] = prices_response.status_code
         
         if prices_response.status_code == 200:
             prices_result = prices_response.json()
+            debug_info['prices_sample'] = prices_result[:3] if isinstance(prices_result, list) else []
+            
             if isinstance(prices_result, list):
                 for price in prices_result:
                     if isinstance(price, dict) and 'coin' in price and 'price' in price:
@@ -145,6 +165,7 @@ def fetch_all_markets():
 
         # Process market data for each coin
         markets = []
+        skipped_markets = []
         
         for coin in coins:
             try:
@@ -153,11 +174,41 @@ def fetch_all_markets():
                 
                 # Get stats
                 stats = stats_data.get(coin, {})
-                volume_24h = float(stats.get('volume24h', 0)) if stats else 0
-                open_interest = float(stats.get('openInterest', 0)) if stats else 0
+                
+                # Get volume - fix for handling string values and scientific notation
+                volume_24h_raw = stats.get('volume24h', 0)
+                
+                # Convert to float, handling both string and numeric formats
+                if isinstance(volume_24h_raw, str):
+                    # Remove commas and convert to float
+                    volume_24h = float(volume_24h_raw.replace(',', ''))
+                else:
+                    volume_24h = float(volume_24h_raw)
+                
+                # Get open interest with similar handling
+                open_interest_raw = stats.get('openInterest', 0)
+                if isinstance(open_interest_raw, str):
+                    open_interest = float(open_interest_raw.replace(',', ''))
+                else:
+                    open_interest = float(open_interest_raw)
+                
+                # For debugging
+                if coin in ['BTC-USD', 'ETH-USD', 'SOL-USD', 'SUI-USD']:
+                    skipped_markets.append({
+                        'symbol': coin,
+                        'volume24h': volume_24h,
+                        'raw_volume': volume_24h_raw,
+                        'min_required': MIN_LIQUIDITY
+                    })
                 
                 # Skip low liquidity markets
                 if volume_24h < MIN_LIQUIDITY:
+                    skipped_markets.append({
+                        'symbol': coin,
+                        'volume24h': volume_24h,
+                        'raw_volume': volume_24h_raw,
+                        'min_required': MIN_LIQUIDITY
+                    })
                     continue
                 
                 # Get funding rate
@@ -175,20 +226,25 @@ def fetch_all_markets():
                 })
                 
             except Exception as e:
-                st.warning(f"Error processing {coin}: {str(e)}")
+                debug_info[f'error_{coin}'] = str(e)
                 continue
         
         # Create DataFrame with all market data
         df = pd.DataFrame(markets)
         
+        # Save debug info
+        debug_info['markets_count'] = len(markets)
+        debug_info['skipped_count'] = len(skipped_markets)
+        debug_info['skipped_markets'] = skipped_markets
+        st.session_state.debug_info = debug_info
+        
         if df.empty:
+            if skipped_markets:
+                st.warning(f"All {len(skipped_markets)} markets were skipped due to liquidity threshold. Consider lowering the minimum liquidity.")
             return df
         
-        # Limited batch processing for candles to avoid timeout
-        # Only process first 10 markets for 24h change to avoid timeout
-        top_markets = df.head(10)
-        
-        for symbol in top_markets['symbol']:
+        # Only calculate 24h change for top markets to avoid timeout
+        for symbol in df['symbol'].head(5):
             try:
                 candles = fetch_hyperliquid_candles(symbol, interval='1d', limit=2)
                 if candles is not None and len(candles) >= 2:
@@ -199,16 +255,17 @@ def fetch_all_markets():
                     )
             except Exception as e:
                 # Just skip if we can't get change data
-                pass
+                continue
         
         return df.sort_values('volume24h', ascending=False)
         
     except Exception as e:
         st.error(f"Error fetching markets: {str(e)}")
+        st.session_state.debug_info['fetch_error'] = str(e)
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
-def fetch_hyperliquid_candles(coin, interval="1h", limit=100):  # Reduced default limit
+def fetch_hyperliquid_candles(coin, interval="1h", limit=50):
     """Fetch OHLCV data for a specific coin"""
     try:
         now = int(time.time())
@@ -248,12 +305,6 @@ def fetch_hyperliquid_candles(coin, interval="1h", limit=100):  # Reduced defaul
     except Exception as e:
         st.error(f"Error fetching candles for {coin}: {str(e)}")
         return None
-
-# Initialize session state if not already present
-if 'signals' not in st.session_state:
-    st.session_state.signals = []
-if 'scanned_markets' not in st.session_state:
-    st.session_state.scanned_markets = pd.DataFrame()
 
 # Sidebar for parameters
 with st.sidebar:
@@ -437,7 +488,7 @@ def init_market_cache():
 # Initialize cache tables
 init_market_cache()
 
-# Modified function to analyze and generate signals without timing out
+# Function to analyze and generate signals in manageable chunks
 def generate_signals(markets_df):
     """Generate trading signals based on volume analysis and funding rates"""
     if markets_df is None or markets_df.empty:
@@ -445,8 +496,10 @@ def generate_signals(markets_df):
     
     signals = []
     
-    # Limit processing to top 20 markets by volume to avoid timeout
-    top_markets = markets_df.head(20)
+    # Limit analysis to top markets by volume to avoid timeout
+    # Use a smaller number if you're experiencing timeouts
+    max_markets = 15
+    top_markets = markets_df.head(max_markets)
     total_markets = len(top_markets)
     
     progress_bar = st.progress(0)
@@ -456,12 +509,13 @@ def generate_signals(markets_df):
         symbol = market['symbol']
         status_text.text(f"Analyzing {symbol}... ({i+1}/{total_markets})")
         
-        progress_value = (i + 1) / total_markets
-        progress_bar.progress(progress_value)
+        # Update progress bar at reasonable intervals
+        if i % 2 == 0 or i == total_markets - 1:
+            progress_bar.progress((i + 1) / total_markets)
         
-        # Fetch hourly data - limited to 48 hours instead of 168 to reduce processing time
+        # Fetch hourly data - limited to 48h to reduce processing
         df = fetch_hyperliquid_candles(symbol, interval='1h', limit=48) 
-        if df is None or len(df) < 24:
+        if df is None or len(df) < 6:  # Need at least a few hours of data
             continue
             
         # Calculate volume metrics
@@ -522,70 +576,93 @@ def generate_signals(markets_df):
             'TP': tp,
             'SL': sl
         })
-        
+    
     progress_bar.empty()
     status_text.empty()
     
     return signals
 
-# Function to fetch markets and store them in session state
+# Function to scan markets with better error handling 
 def scan_markets():
-    # First display all markets before signal analysis to improve UX
-    with st.spinner("Fetching markets data..."):
-        markets_df = fetch_all_markets()
-        st.session_state.scanned_markets = markets_df
-        
-        if markets_df.empty:
-            st.error("No markets found meeting current liquidity threshold. Try lowering the minimum liquidity.")
-            return
+    """Scan markets and store them in session state with comprehensive error handling"""
+    # Clear previous markets and signals
+    st.session_state.scanned_markets = pd.DataFrame()
+    st.session_state.signals = []
+    
+    # First, fetch the raw market data
+    try:
+        with st.spinner("Fetching market data..."):
+            markets_df = fetch_all_markets()
             
-        st.success(f"Found {len(markets_df)} markets meeting the liquidity threshold.")
-        
-    # Now generate trading signals based on the markets
-    with st.spinner("Analyzing markets for trading signals..."):
-        signals = generate_signals(markets_df)
-        st.session_state.signals = signals
-        
-        if not signals:
-            st.warning("No trading signals found with the current parameters.")
-            return
-            
-        st.success(f"Analysis complete. Found {len([s for s in signals if s['Signal'] != 'HOLD'])} actionable signals.")
+            if markets_df.empty:
+                # Check debug info for clues
+                if 'debug_info' in st.session_state:
+                    debug = st.session_state.debug_info
+                    if 'skipped_markets' in debug and debug['skipped_markets']:
+                        skipped = debug['skipped_markets']
+                        sample_market = skipped[0] if skipped else {}
+                        st.warning(f"Found data but all markets were below the liquidity threshold. Sample: {sample_market}")
+                    else:
+                        st.error("No market data found. Check API connection.")
+                return
+                
+            # Store markets in session state
+            st.session_state.scanned_markets = markets_df
+            st.success(f"Found {len(markets_df)} markets meeting the minimum liquidity threshold.")
+    
+    except Exception as e:
+        st.error(f"Error during market scan: {str(e)}")
+        return
+    
+    # Then, generate signals in a separate step
+    try:
+        if not markets_df.empty:
+            with st.spinner("Analyzing markets for trading signals..."):
+                signals = generate_signals(markets_df)
+                st.session_state.signals = signals
+                
+                actionable_count = len([s for s in signals if s['Signal'] != 'HOLD'])
+                if actionable_count > 0:
+                    st.success(f"Analysis complete. Found {actionable_count} actionable signals.")
+                else:
+                    st.info("Analysis complete. No actionable signals found with current parameters.")
+    
+    except Exception as e:
+        st.error(f"Error during signal generation: {str(e)}")
+        # At least we have the market data, even if signal generation failed
 
 # Initialize the forward tester
 tester = ForwardTester()
 
 # Create tabs for different sections
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Market Scanner", "Active Trades", "Completed Trades", "Performance", "Database"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Market Scanner", "Active Trades", "Completed Trades", "Performance", "Database", "Debug"])
 
 # Tab 1: Market Scanner
 with tab1:
     # Display current liquidity setting
     st.info(f"Current Minimum Liquidity: ${MIN_LIQUIDITY:,} USD")
     
-    col1, col2 = st.columns([1, 3])
-    
-    with col1:
-        if st.button("Scan Markets", use_container_width=True):
-            scan_markets()
-    
-    with col2:
-        # Add debug info to show raw market data
-        if st.session_state.scanned_markets is not None and not st.session_state.scanned_markets.empty:
-            st.success(f"Found {len(st.session_state.scanned_markets)} markets with at least ${MIN_LIQUIDITY:,} liquidity")
+    if st.button("Scan Markets", use_container_width=True):
+        scan_markets()
     
     # Show raw markets data regardless of signal generation
     if not st.session_state.scanned_markets.empty:
-        st.subheader("All Markets Data")
+        st.subheader("All Markets")
+        
+        # Format the data for display
+        display_df = st.session_state.scanned_markets.copy()
+        
+        # Show the table with nice formatting
         st.dataframe(
-            st.session_state.scanned_markets[['symbol', 'markPrice', 'volume24h', 'openInterest', 'fundingRate', 'change24h']],
+            display_df,
             use_container_width=True,
             column_config={
+                'symbol': st.column_config.TextColumn("Symbol"),
                 'markPrice': st.column_config.NumberColumn("Mark Price", format="%.4f"),
-                'volume24h': st.column_config.NumberColumn("24h Volume", format="$%d"),
-                'openInterest': st.column_config.NumberColumn("Open Interest", format="$%d"),
+                'volume24h': st.column_config.NumberColumn("24h Volume", format="$%.2f"),
+                'openInterest': st.column_config.NumberColumn("Open Interest", format="$%.2f"),
                 'fundingRate': st.column_config.NumberColumn("Funding Rate (bps)", format="%.2f"),
-                'change24h': st.column_config.NumberColumn("24h Change %", format="%.2f%%")
+                'change24h': st.column_config.NumberColumn("24h Change", format="%.2f%%")
             }
         )
     
@@ -608,7 +685,7 @@ with tab1:
                 use_container_width=True,
                 column_config={
                     'Price': st.column_config.NumberColumn("Price", format="%.4f"),
-                    'Volume 24h': st.column_config.NumberColumn("Volume 24h", format="$%d"),
+                    'Volume 24h': st.column_config.NumberColumn("Volume 24h", format="$%.2f"),
                     'Funding Rate': st.column_config.NumberColumn("Funding Rate (bps)", format="%.2f"),
                     'Vol Surge': st.column_config.NumberColumn("Volume Surge", format="%.2fx")
                 }
@@ -831,6 +908,69 @@ with tab5:
                     st.success("Cache cleared successfully")
             except Exception as e:
                 st.error(f"Failed to clear cache: {str(e)}")
+
+# Tab 6: Debug Information
+with tab6:
+    st.header("Debug Information")
+    
+    st.subheader("API Connection Status")
+    
+    # Test API connection button
+    if st.button("Test API Connection"):
+        try:
+            meta_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "meta"})
+            stats_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "stats"})
+            oracle_response = requests.post(HYPERLIQUID_INFO_API, json={"type": "oracle"})
+            
+            st.success(f"Meta API: {meta_response.status_code}")
+            st.success(f"Stats API: {stats_response.status_code}")
+            st.success(f"Oracle API: {oracle_response.status_code}")
+            
+            if meta_response.status_code == 200:
+                st.json(meta_response.json()[:2])  # Show first 2 items
+        except Exception as e:
+            st.error(f"API connection test failed: {str(e)}")
+    
+    # Show debug info if available
+    if st.session_state.debug_info:
+        st.subheader("Last Scan Debug Info")
+        
+        # Markets summary
+        if 'markets_count' in st.session_state.debug_info:
+            st.write(f"Markets found: {st.session_state.debug_info['markets_count']}")
+            st.write(f"Markets skipped: {st.session_state.debug_info['skipped_count']}")
+        
+        # Show sample skipped markets
+        if 'skipped_markets' in st.session_state.debug_info and st.session_state.debug_info['skipped_markets']:
+            st.subheader("Sample Skipped Markets")
+            skipped_df = pd.DataFrame(st.session_state.debug_info['skipped_markets'][:5])  # Show first 5
+            st.dataframe(skipped_df)
+        
+        # Show any errors
+        errors = {k: v for k, v in st.session_state.debug_info.items() if k.startswith('error')}
+        if errors:
+            st.subheader("Errors")
+            for k, v in errors.items():
+                st.error(f"{k}: {v}")
+    
+    # Cache status
+    st.subheader("Cache Status")
+    if os.path.exists('market_cache.db'):
+        conn = sqlite3.connect('market_cache.db')
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM market_cache")
+        market_cache_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM ohlcv_cache")
+        ohlcv_cache_count = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        st.write(f"Markets in cache: {market_cache_count}")
+        st.write(f"OHLCV data sets in cache: {ohlcv_cache_count}")
+    else:
+        st.write("Cache database not found.")
 
 # Update timestamp in the footer
 st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
