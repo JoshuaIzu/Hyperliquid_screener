@@ -139,6 +139,25 @@ def safe_float(value, default=0.0):
     except (ValueError, TypeError):
         return default
 
+def estimate_volume_from_orderbook(symbol, price):
+    """Estimate 24h volume from orderbook liquidity using CCXT"""
+    try:
+        # Fetch order book with retry
+        orderbook = api_request_with_retry(exchange.fetch_order_book, symbol)
+        
+        asks = orderbook.get('asks', [])
+        bids = orderbook.get('bids', [])
+        
+        # Calculate liquidity within 2% of price
+        ask_liquidity = sum(amount for bid_price, amount in asks if bid_price <= price * 1.02)
+        bid_liquidity = sum(amount for ask_price, amount in bids if ask_price >= price * 0.98)
+        
+        # Estimate 24h volume as (bid + ask liquidity) * price * turnover factor
+        return (ask_liquidity + bid_liquidity) * price * 4
+        
+    except Exception as e:
+        return 0
+
 @st.cache_data(ttl=60)
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid with individual API calls (fixed version)"""
@@ -149,9 +168,9 @@ def fetch_all_markets():
         markets = api_request_with_retry(exchange.load_markets)
         debug_info['total_markets'] = len(markets)
         
-        # Filter for perpetual contracts only
+        # Filter for perpetual contracts only and exclude USDC pairs
         perp_markets = {symbol: market for symbol, market in markets.items() 
-                       if market['type'] == 'swap' and not market['spot']}
+                       if market['type'] == 'swap' and not market['spot'] and not symbol.endswith('USDC:USDC')}
         debug_info['perpetual_markets'] = len(perp_markets)
         
         # Process market data
@@ -170,21 +189,39 @@ def fetch_all_markets():
                 progress.progress(progress_pct)
                 status.text(f"Processing {i+1}/{len(perp_markets)}: {symbol}")
                 
-                # Fetch individual ticker with retry
-                ticker = api_request_with_retry(exchange.fetch_ticker, symbol)
-                base_currency = market['base']
+                # Try alternative methods to get price data
+                price = None
+                volume_24h = 0
                 
-                # Skip markets without valid ticker data
-                if not ticker or 'last' not in ticker or not ticker['last']:
+                # Method 1: Try fetching order book
+                try:
+                    orderbook = api_request_with_retry(exchange.fetch_order_book, symbol, limit=1)
+                    if orderbook and 'bids' in orderbook and orderbook['bids']:
+                        price = orderbook['bids'][0][0]  # Use best bid as price estimate
+                except:
+                    pass
+                
+                # Method 2: Try fetching trades if orderbook fails
+                if price is None:
+                    try:
+                        trades = api_request_with_retry(exchange.fetch_trades, symbol, limit=1)
+                        if trades and len(trades) > 0:
+                            price = trades[0]['price']
+                    except:
+                        pass
+                
+                # Skip if we couldn't get price data
+                if price is None:
                     skipped_markets.append({
                         'symbol': symbol,
-                        'reason': 'No price data',
+                        'reason': 'Could not get price data',
                         'min_required': MIN_LIQUIDITY
                     })
                     continue
                 
-                price = ticker['last']
-                volume_24h = safe_float(ticker.get('quoteVolume', 0))
+                # Estimate volume from order book if needed
+                if st.session_state.use_orderbook_fallback:
+                    volume_24h = estimate_volume_from_orderbook(symbol, price)
                 
                 # Get funding rate
                 funding_rate = 0
@@ -203,15 +240,10 @@ def fetch_all_markets():
                     if oi_data and 'openInterestAmount' in oi_data:
                         open_interest = safe_float(oi_data['openInterestAmount']) * price
                 except Exception as e:
-                    try:
-                        # Fallback: try using orderbook to estimate liquidity
-                        if 'use_orderbook_fallback' in st.session_state and st.session_state.use_orderbook_fallback:
-                            open_interest = estimate_volume_from_orderbook(symbol, price) / 10
-                    except:
-                        pass
                     debug_info[f'oi_error_{symbol}'] = str(e)
                 
                 # Store special coins for debugging
+                base_currency = market['base']
                 if base_currency in ['BTC', 'ETH', 'SOL']:
                     debug_info[f'{base_currency}_details'] = {
                         'symbol': symbol,
@@ -230,11 +262,8 @@ def fetch_all_markets():
                     })
                     continue
                 
-                # Calculate price change if available
-                change_24h = safe_float(ticker.get('percentage', 0))
-                if not change_24h and 'info' in ticker:
-                    # Try to extract from ticker info if available
-                    change_24h = safe_float(ticker.get('info', {}).get('priceChangePercent', 0))
+                # Calculate price change - we can't get this without ticker data
+                change_24h = 0
                 
                 market_data.append({
                     'symbol': base_currency,         # Use base currency as symbol for simplicity
@@ -267,7 +296,7 @@ def fetch_all_markets():
         
         if df.empty:
             if skipped_markets:
-                st.warning(f"All {len(skipped_markets)} markets were skipped due to liquidity threshold. Consider lowering the minimum liquidity.")
+                st.warning(f"All {len(skipped_markets)} markets were skipped. Reasons: {', '.join(set(m['reason'] for m in skipped_markets))}")
             return df
             
         return df.sort_values('volume24h', ascending=False)
@@ -293,14 +322,14 @@ def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
         markets = exchange.load_markets()
         full_symbol = None
         
-        # Find the corresponding full symbol
+        # Find the corresponding full symbol (excluding USDC pairs)
         for sym in markets:
-            if markets[sym]['type'] == 'swap' and markets[sym]['base'] == symbol:
+            if markets[sym]['type'] == 'swap' and markets[sym]['base'] == symbol and not sym.endswith('USDC:USDC'):
                 full_symbol = sym
                 break
         
         if not full_symbol:
-            st.warning(f"Could not find full symbol for {symbol}")
+            st.warning(f"Could not find full symbol for {symbol} (excluding USDC pairs)")
             return None
         
         # Fetch OHLCV data with retry
@@ -317,38 +346,6 @@ def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
     except Exception as e:
         st.error(f"Error fetching candles for {symbol}: {str(e)}")
         return None
-
-# Alternative method if orderbook is needed
-def estimate_volume_from_orderbook(symbol, price):
-    """Estimate 24h volume from orderbook liquidity using CCXT"""
-    try:
-        # Find the full symbol
-        markets = exchange.load_markets()
-        full_symbol = None
-        
-        for sym in markets:
-            if markets[sym]['type'] == 'swap' and markets[sym]['base'] == symbol:
-                full_symbol = sym
-                break
-        
-        if not full_symbol:
-            return 0
-            
-        # Fetch order book with retry
-        orderbook = api_request_with_retry(exchange.fetch_order_book, full_symbol)
-        
-        asks = orderbook.get('asks', [])
-        bids = orderbook.get('bids', [])
-        
-        # Calculate liquidity within 2% of price
-        ask_liquidity = sum(price * amount for price, amount in asks if price <= price * 1.02)
-        bid_liquidity = sum(price * amount for price, amount in bids if price >= price * 0.98)
-        
-        # Estimate 24h volume as liquidity * turnover factor
-        return (ask_liquidity + bid_liquidity) * 4
-        
-    except Exception as e:
-        return 0
 
 # Sidebar for parameters
 with st.sidebar:
@@ -759,7 +756,8 @@ with tab1:
             st.dataframe(
                 filtered_df,
                 use_container_width=True,
-                column_config={                    'Price': st.column_config.NumberColumn("Price", format="%.4f"),
+                column_config={
+                    'Price': st.column_config.NumberColumn("Price", format="%.4f"),
                     'Volume 24h': st.column_config.NumberColumn("Volume 24h", format="$%.2f"),
                     'Funding Rate': st.column_config.NumberColumn("Funding Rate (bps)", format="%.2f"),
                     'Vol Surge': st.column_config.NumberColumn("Volume Surge", format="%.2fx")
@@ -1003,10 +1001,10 @@ with tab6:
             
             # Test loading markets
             markets = exchange.load_markets()
-            perp_markets = {k: v for k, v in markets.items() if v.get('type') == 'swap'}
+            perp_markets = {k: v for k, v in markets.items() if v.get('type') == 'swap' and not k.endswith('USDC:USDC')}
             
             st.write(f"Total markets: {len(markets)}")
-            st.write(f"Perpetual markets: {len(perp_markets)}")
+            st.write(f"Perpetual markets (excluding USDC): {len(perp_markets)}")
             
             # Show sample market details
             if perp_markets:
@@ -1014,12 +1012,15 @@ with tab6:
                 st.write(f"Sample market: {sample_symbol}")
                 st.json(perp_markets[sample_symbol])
             
-            # Test fetching a ticker
+            # Test fetching order book
             if perp_markets:
                 sample_symbol = list(perp_markets.keys())[0]
-                ticker = exchange.fetch_ticker(sample_symbol)
-                st.write(f"Ticker data for {sample_symbol}:")
-                st.json({k: v for k, v in ticker.items() if k in ['last', 'bid', 'ask', 'quoteVolume', 'baseVolume']})
+                orderbook = exchange.fetch_order_book(sample_symbol)
+                st.write(f"Order book data for {sample_symbol}:")
+                st.json({
+                    'bids': orderbook['bids'][:2] if 'bids' in orderbook else [],
+                    'asks': orderbook['asks'][:2] if 'asks' in orderbook else []
+                })
         
         except Exception as e:
             st.error(f"CCXT connection test failed: {str(e)}")
