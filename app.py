@@ -27,6 +27,44 @@ VOL_MULTIPLIER = 1.5
 MIN_LIQUIDITY = 50000  # Lower default to 50k
 FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
 
+# Rate limiter class
+class RateLimiter:
+    def __init__(self, calls_per_second=2):
+        self.calls_per_second = calls_per_second
+        self.min_interval = 1.0 / calls_per_second
+        self.last_call_time = 0
+    
+    def wait(self):
+        """Wait if needed to respect the rate limit"""
+        current_time = time.time()
+        elapsed = current_time - self.last_call_time
+        
+        if elapsed < self.min_interval:
+            sleep_time = self.min_interval - elapsed
+            time.sleep(sleep_time)
+        
+        self.last_call_time = time.time()
+
+# Initialize the rate limiter
+rate_limiter = RateLimiter(calls_per_second=3)
+
+# API request with retry logic
+def api_request_with_retry(func, *args, max_retries=3, **kwargs):
+    """Execute an API request with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            rate_limiter.wait()  # Respect rate limits
+            return func(*args, **kwargs)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                # Last attempt failed, re-raise the exception
+                raise
+            # Wait with exponential backoff
+            time.sleep(1 * (2 ** attempt))
+    
+    # This should never be reached due to the exception in the loop
+    return None
+
 # Initialize CCXT exchange instance
 @st.cache_resource
 def init_exchange():
@@ -103,12 +141,12 @@ def safe_float(value, default=0.0):
 
 @st.cache_data(ttl=60)
 def fetch_all_markets():
-    """Fetch all perpetual contracts from Hyperliquid with comprehensive market data using CCXT"""
+    """Fetch all perpetual contracts from Hyperliquid with individual API calls (fixed version)"""
     try:
         debug_info = {}
         
         # Load all markets
-        markets = exchange.load_markets()
+        markets = api_request_with_retry(exchange.load_markets)
         debug_info['total_markets'] = len(markets)
         
         # Filter for perpetual contracts only
@@ -116,25 +154,24 @@ def fetch_all_markets():
                        if market['type'] == 'swap' and not market['spot']}
         debug_info['perpetual_markets'] = len(perp_markets)
         
-        # Fetch tickers for all markets to get prices and volumes
-        tickers = exchange.fetch_tickers(list(perp_markets.keys()))
-        debug_info['tickers_fetched'] = len(tickers)
-        
-        # Fetch funding rates
-        try:
-            funding_rates = exchange.fetch_funding_rates()
-            debug_info['funding_rates_fetched'] = len(funding_rates)
-        except Exception as e:
-            debug_info['funding_error'] = str(e)
-            funding_rates = {}
-        
         # Process market data
         market_data = []
         skipped_markets = []
         
-        for symbol, market in perp_markets.items():
+        # Progress tracking
+        progress = st.progress(0)
+        status = st.empty()
+        
+        # Process markets individually
+        for i, (symbol, market) in enumerate(perp_markets.items()):
             try:
-                ticker = tickers.get(symbol, {})
+                # Update progress
+                progress_pct = (i + 1) / len(perp_markets)
+                progress.progress(progress_pct)
+                status.text(f"Processing {i+1}/{len(perp_markets)}: {symbol}")
+                
+                # Fetch individual ticker with retry
+                ticker = api_request_with_retry(exchange.fetch_ticker, symbol)
                 base_currency = market['base']
                 
                 # Skip markets without valid ticker data
@@ -151,17 +188,27 @@ def fetch_all_markets():
                 
                 # Get funding rate
                 funding_rate = 0
-                if symbol in funding_rates and funding_rates[symbol] and 'fundingRate' in funding_rates[symbol]:
-                    # Convert to annualized basis points (assuming 8h funding periods)
-                    funding_rate = safe_float(funding_rates[symbol]['fundingRate']) * 10000 * 3 * 365
+                try:
+                    funding_info = api_request_with_retry(exchange.fetch_funding_rate, symbol)
+                    if funding_info and 'fundingRate' in funding_info:
+                        # Convert to annualized basis points (assuming 8h funding periods)
+                        funding_rate = safe_float(funding_info['fundingRate']) * 10000 * 3 * 365
+                except Exception as e:
+                    debug_info[f'funding_error_{symbol}'] = str(e)
                 
-                # Get open interest using CCXT
+                # Get open interest
                 open_interest = 0
                 try:
-                    oi_data = exchange.fetch_open_interest(symbol)
+                    oi_data = api_request_with_retry(exchange.fetch_open_interest, symbol)
                     if oi_data and 'openInterestAmount' in oi_data:
                         open_interest = safe_float(oi_data['openInterestAmount']) * price
                 except Exception as e:
+                    try:
+                        # Fallback: try using orderbook to estimate liquidity
+                        if 'use_orderbook_fallback' in st.session_state and st.session_state.use_orderbook_fallback:
+                            open_interest = estimate_volume_from_orderbook(symbol, price) / 10
+                    except:
+                        pass
                     debug_info[f'oi_error_{symbol}'] = str(e)
                 
                 # Store special coins for debugging
@@ -185,6 +232,9 @@ def fetch_all_markets():
                 
                 # Calculate price change if available
                 change_24h = safe_float(ticker.get('percentage', 0))
+                if not change_24h and 'info' in ticker:
+                    # Try to extract from ticker info if available
+                    change_24h = safe_float(ticker.get('info', {}).get('priceChangePercent', 0))
                 
                 market_data.append({
                     'symbol': base_currency,         # Use base currency as symbol for simplicity
@@ -201,6 +251,10 @@ def fetch_all_markets():
             except Exception as e:
                 debug_info[f'error_{symbol}'] = str(e)
                 continue
+        
+        # Clear progress and status
+        progress.empty()
+        status.empty()
         
         # Create DataFrame and sort by volume
         df = pd.DataFrame(market_data)
@@ -225,7 +279,7 @@ def fetch_all_markets():
 
 @st.cache_data(ttl=300)
 def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
-    """Fetch OHLCV data for a specific symbol using CCXT"""
+    """Fetch OHLCV data for a specific symbol using CCXT with retries"""
     try:
         # Map interval string to CCXT timeframe
         timeframe_map = {
@@ -249,8 +303,8 @@ def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
             st.warning(f"Could not find full symbol for {symbol}")
             return None
         
-        # Fetch OHLCV data
-        ohlcv = exchange.fetch_ohlcv(full_symbol, timeframe, limit=limit)
+        # Fetch OHLCV data with retry
+        ohlcv = api_request_with_retry(exchange.fetch_ohlcv, full_symbol, timeframe, limit=limit)
         
         if not ohlcv or len(ohlcv) == 0:
             return None
@@ -280,8 +334,8 @@ def estimate_volume_from_orderbook(symbol, price):
         if not full_symbol:
             return 0
             
-        # Fetch order book
-        orderbook = exchange.fetch_order_book(full_symbol)
+        # Fetch order book with retry
+        orderbook = api_request_with_retry(exchange.fetch_order_book, full_symbol)
         
         asks = orderbook.get('asks', [])
         bids = orderbook.get('bids', [])
@@ -323,7 +377,7 @@ with st.sidebar:
     
     # Advanced settings in expander
     with st.expander("Advanced Settings"):
-        use_orderbook_fallback = st.checkbox(
+        st.session_state.use_orderbook_fallback = st.checkbox(
             "Use orderbook fallback", 
             value=True, 
             help="If enabled, will estimate volume from orderbook when API volume data is missing"
@@ -336,6 +390,15 @@ with st.sidebar:
             step=1000.0,
             help="Volume threshold below which orderbook fallback will be used"
         )
+        
+        api_calls_per_second = st.slider(
+            "API calls per second",
+            min_value=1,
+            max_value=10,
+            value=3,
+            help="Limit API call frequency to avoid rate limiting"
+        )
+        rate_limiter.calls_per_second = api_calls_per_second
     
     FUNDING_THRESHOLD = st.slider("Funding Rate Threshold (basis points)", 10, 200, 60, 5)
 
@@ -497,7 +560,7 @@ def init_market_cache():
 # Initialize cache tables
 init_market_cache()
 
-# Function to analyze and generate signals in manageable chunks
+# Function to analyze and generate signals
 def generate_signals(markets_df):
     """Generate trading signals based on volume analysis and funding rates"""
     if markets_df is None or markets_df.empty:
@@ -536,7 +599,7 @@ def generate_signals(markets_df):
         tp = "-"
         sl = "-"
         
-        # Get funding rate
+        # Get funding rate from the market data
         funding_rate = market['fundingRate']
         
         # Check volume surge and funding rate for signal
@@ -599,7 +662,7 @@ def scan_markets():
     
     # First, fetch the raw market data
     try:
-        with st.spinner("Fetching market data using CCXT..."):
+        with st.spinner("Fetching market data from Hyperliquid..."):
             markets_df = fetch_all_markets()
             
             if markets_df.empty:
@@ -696,8 +759,7 @@ with tab1:
             st.dataframe(
                 filtered_df,
                 use_container_width=True,
-                column_config={
-                    'Price': st.column_config.NumberColumn("Price", format="%.4f"),
+                column_config={                    'Price': st.column_config.NumberColumn("Price", format="%.4f"),
                     'Volume 24h': st.column_config.NumberColumn("Volume 24h", format="$%.2f"),
                     'Funding Rate': st.column_config.NumberColumn("Funding Rate (bps)", format="%.2f"),
                     'Vol Surge': st.column_config.NumberColumn("Volume Surge", format="%.2fx")
