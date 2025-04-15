@@ -8,8 +8,6 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import sqlite3
 import time
-import eth_account
-from eth_account.signers.local import LocalAccount
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
