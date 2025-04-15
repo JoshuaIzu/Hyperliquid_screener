@@ -28,7 +28,7 @@ HYPERLIQUID_EXCHANGE_API = "https://api.hyperliquid.xyz/exchange"
 # Configuration
 BASE_VOL = 0.35
 VOL_MULTIPLIER = 1.5
-MIN_LIQUIDITY = 5000000
+MIN_LIQUIDITY = 500000
 FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
 
 # Database functions for state management
