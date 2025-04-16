@@ -220,15 +220,6 @@ def fetch_all_markets():
                 except Exception as e:
                     debug_info[f'funding_error_{symbol}'] = str(e)
                 
-                # Get open interest
-                open_interest = 0
-                try:
-                    oi_data = api_request_with_retry(info.open_interest)
-                    oi_entry = next((item for item in oi_data if item['coin'] == symbol), None)
-                    if oi_entry:
-                        open_interest = safe_float(oi_entry['openInterest']) * price
-                except Exception as e:
-                    debug_info[f'oi_error_{symbol}'] = str(e)
                 
                 # Skip if below liquidity threshold
                 if volume_24h < MIN_LIQUIDITY:
@@ -258,10 +249,8 @@ def fetch_all_markets():
                     'markPrice': price,
                     'lastPrice': price,
                     'fundingRate': funding_rate,
-                    'openInterest': open_interest,
                     'volume24h': volume_24h,
                     'change24h': change_24h,
-                    'liquidityScore': volume_24h / open_interest if open_interest > 0 else 0
                 })
                 
             except Exception as e:
