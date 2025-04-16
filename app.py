@@ -138,46 +138,37 @@ def safe_float(value, default=0.0):
 
 # Then modify the estimate_volume_from_orderbook function:
 def estimate_volume_from_orderbook(symbol):
-    """Estimate 24h volume from orderbook liquidity using Hyperliquid SDK"""
+    """Estimate 24h volume from orderbook liquidity"""
     try:
-        # Use the correct API endpoint for orderbook
-        orderbook = api_request_with_retry(info.l2_snapshot, symbol)
-        
-        if not orderbook or 'levels' not in orderbook:
+        book = api_request_with_retry(info.l2_snapshot, symbol)
+        if not book or 'levels' not in book:
             return 0
             
-        levels = orderbook['levels']
-        bids = [level for level in levels if level[0] == 'b']
-        asks = [level for level in levels if level[0] == 'a']
+        levels = book['levels']
+        if not levels:
+            return 0
+            
+        # Get top 5 levels
+        bids = [l for l in levels if l[0] == 'b'][:5]
+        asks = [l for l in levels if l[0] == 'a'][:5]
         
         if not bids or not asks:
             return 0
             
+        # Calculate total liquidity
+        bid_liquidity = sum(float(l[2]) for l in bids)
+        ask_liquidity = sum(float(l[2]) for l in asks)
+        
         # Get mid price
-        best_bid = float(bids[0][1])
-        best_ask = float(asks[0][1])
-        price = (best_bid + best_ask) / 2
+        mid_price = (float(bids[0][1]) + float(asks[0][1])) / 2
         
-        # Calculate liquidity within 2% of price
-        ask_liquidity = sum(float(level[2]) for level in asks if float(level[1]) <= price * 1.02)
-        bid_liquidity = sum(float(level[2]) for level in bids if float(level[1]) >= price * 0.98)
-        
-        # Estimate 24h volume
-        return (ask_liquidity + bid_liquidity) * price * 4
+        # Estimate daily volume (liquidity * price * turnover factor)
+        return (bid_liquidity + ask_liquidity) * mid_price * 10
         
     except Exception as e:
-        st.error(f"Error estimating volume for {symbol}: {str(e)}")
-        return 0
-
-# Update the price fetching in fetch_all_markets():
-# Replace the orderbook section with:
-try:
-    ticker = api_request_with_retry(info.all_mids)
-    price = float(ticker.get(symbol, 0))
-    if price == 0:
-        raise ValueError("No price data")
-except:
-    price = None
+        st.error(f"Volume estimation error for {symbol}: {str(e)}")
+        return 0   
+        
 @st.cache_data(ttl=60)
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid using the SDK"""
@@ -188,6 +179,9 @@ def fetch_all_markets():
         meta = api_request_with_retry(info.meta)
         debug_info['total_markets'] = len(meta['universe'])
         
+        # Get all mid prices at once (more efficient)
+        all_prices = api_request_with_retry(info.all_mids)
+        
         # Process market data
         market_data = []
         skipped_markets = []
@@ -196,7 +190,6 @@ def fetch_all_markets():
         progress = st.progress(0)
         status = st.empty()
         
-        # Process markets individually
         for i, coin in enumerate(meta['universe']):
             symbol = coin['name']
             try:
@@ -205,22 +198,9 @@ def fetch_all_markets():
                 progress.progress(progress_pct)
                 status.text(f"Processing {i+1}/{len(meta['universe'])}: {symbol}")
                 
-                # Get price data
-                price = None
-                volume_24h = 0
-                
-                # Method 1: Try fetching order book
-                try:
-                    orderbook = api_request_with_retry(info.orderbook, symbol)
-                    if orderbook and 'bids' in orderbook and orderbook['bids']:
-                        best_bid = orderbook['bids'][0]['px']
-                        best_ask = orderbook['asks'][0]['px'] if 'asks' in orderbook and orderbook['asks'] else best_bid
-                        price = (best_bid + best_ask) / 2
-                except:
-                    pass
-                
-                # Skip if we couldn't get price data
-                if price is None:
+                # Get price from all_mids
+                price = safe_float(all_prices.get(symbol))
+                if not price:
                     skipped_markets.append({
                         'symbol': symbol,
                         'reason': 'Could not get price data',
@@ -228,16 +208,14 @@ def fetch_all_markets():
                     })
                     continue
                 
-                # Estimate volume from order book if needed
-                if st.session_state.use_orderbook_fallback:
-                    volume_24h = estimate_volume_from_orderbook(symbol)
+                # Estimate volume (simplified approach)
+                volume_24h = estimate_volume_from_orderbook(symbol)
                 
                 # Get funding rate
                 funding_rate = 0
                 try:
                     funding_info = api_request_with_retry(info.funding_history, symbol, 1)
                     if funding_info and len(funding_info) > 0:
-                        # Convert to annualized basis points (assuming 8h funding periods)
                         funding_rate = safe_float(funding_info[0]['fundingRate']) * 10000 * 3 * 365
                 except Exception as e:
                     debug_info[f'funding_error_{symbol}'] = str(e)
@@ -252,16 +230,6 @@ def fetch_all_markets():
                 except Exception as e:
                     debug_info[f'oi_error_{symbol}'] = str(e)
                 
-                # Store special coins for debugging
-                if symbol in ['BTC', 'ETH', 'SOL']:
-                    debug_info[f'{symbol}_details'] = {
-                        'symbol': symbol,
-                        'price': price,
-                        'volume': volume_24h,
-                        'open_interest': open_interest,
-                        'funding_rate': funding_rate
-                    }
-                
                 # Skip if below liquidity threshold
                 if volume_24h < MIN_LIQUIDITY:
                     skipped_markets.append({
@@ -271,10 +239,12 @@ def fetch_all_markets():
                     })
                     continue
                 
-                # Calculate price change - we'll get this from candles
+                # Calculate price change
                 change_24h = 0
                 try:
-                    candles = api_request_with_retry(info.candles_snapshot, symbol, '1h', int((datetime.now() - timedelta(days=1)).timestamp() * 1000), int(datetime.now().timestamp() * 1000))
+                    candles = api_request_with_retry(info.candles_snapshot, symbol, '1h', 
+                                                   int((datetime.now() - timedelta(days=1)).timestamp() * 1000), 
+                                                   int(datetime.now().timestamp() * 1000))
                     if candles and len(candles) > 0:
                         oldest_price = safe_float(candles[0][4])  # open price
                         latest_price = safe_float(candles[-1][5])  # close price
@@ -285,7 +255,6 @@ def fetch_all_markets():
                 
                 market_data.append({
                     'symbol': symbol,
-                    'full_symbol': symbol,  # For consistency with previous version
                     'markPrice': price,
                     'lastPrice': price,
                     'fundingRate': funding_rate,
@@ -303,27 +272,20 @@ def fetch_all_markets():
         progress.empty()
         status.empty()
         
-        # Create DataFrame and sort by volume
+        # Create DataFrame
         df = pd.DataFrame(market_data)
         
         # Save debug info
         debug_info['markets_processed'] = len(market_data)
         debug_info['markets_skipped'] = len(skipped_markets)
-        debug_info['skipped_samples'] = skipped_markets[:5]  # Just show first 5
+        debug_info['skipped_samples'] = skipped_markets[:5]
         st.session_state.debug_info = debug_info
         
-        if df.empty:
-            if skipped_markets:
-                st.warning(f"All {len(skipped_markets)} markets were skipped. Reasons: {', '.join(set(m['reason'] for m in skipped_markets))}")
-            return df
-            
         return df.sort_values('volume24h', ascending=False)
         
     except Exception as e:
         st.error(f"Error fetching markets: {str(e)}")
-        st.session_state.debug_info['fetch_error'] = str(e)
         return pd.DataFrame()
-
 @st.cache_data(ttl=300)
 def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
     """Fetch OHLCV data for a specific symbol using Hyperliquid SDK"""
