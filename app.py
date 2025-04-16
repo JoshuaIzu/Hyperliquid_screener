@@ -698,7 +698,6 @@ with tab1:
                 'symbol': st.column_config.TextColumn("Symbol"),
                 'markPrice': st.column_config.NumberColumn("Mark Price", format="%.4f"),
                 'volume24h': st.column_config.NumberColumn("24h Volume", format="$%.2f"),
-                'openInterest': st.column_config.NumberColumn("Open Interest", format="$%.2f"),
                 'fundingRate': st.column_config.NumberColumn("Funding Rate (bps)", format="%.2f"),
                 'change24h': st.column_config.NumberColumn("24h Change", format="%.2f%%")
             }
