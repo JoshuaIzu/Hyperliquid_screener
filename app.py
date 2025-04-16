@@ -31,7 +31,7 @@ FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
 # Initialize Hyperliquid Info client
 @st.cache_resource
 def init_hyperliquid():
-    return Info(constants.MAINNET_API_URL, skip_ws=True)
+    return Info(skip_ws=True) 
 
 info = init_hyperliquid()
 
@@ -136,34 +136,48 @@ def safe_float(value, default=0.0):
     except (ValueError, TypeError):
         return default
 
+# Then modify the estimate_volume_from_orderbook function:
 def estimate_volume_from_orderbook(symbol):
     """Estimate 24h volume from orderbook liquidity using Hyperliquid SDK"""
     try:
-        # Fetch order book with retry
-        orderbook = api_request_with_retry(info.orderbook, symbol)
+        # Use the correct API endpoint for orderbook
+        orderbook = api_request_with_retry(info.l2_snapshot, symbol)
         
-        asks = orderbook.get('asks', [])
-        bids = orderbook.get('bids', [])
+        if not orderbook or 'levels' not in orderbook:
+            return 0
+            
+        levels = orderbook['levels']
+        bids = [level for level in levels if level[0] == 'b']
+        asks = [level for level in levels if level[0] == 'a']
         
-        if not asks or not bids:
+        if not bids or not asks:
             return 0
             
         # Get mid price
-        best_bid = bids[0]['px']
-        best_ask = asks[0]['px']
+        best_bid = float(bids[0][1])
+        best_ask = float(asks[0][1])
         price = (best_bid + best_ask) / 2
         
         # Calculate liquidity within 2% of price
-        ask_liquidity = sum(level['sz'] for level in asks if level['px'] <= price * 1.02)
-        bid_liquidity = sum(level['sz'] for level in bids if level['px'] >= price * 0.98)
+        ask_liquidity = sum(float(level[2]) for level in asks if float(level[1]) <= price * 1.02)
+        bid_liquidity = sum(float(level[2]) for level in bids if float(level[1]) >= price * 0.98)
         
-        # Estimate 24h volume as (bid + ask liquidity) * price * turnover factor
+        # Estimate 24h volume
         return (ask_liquidity + bid_liquidity) * price * 4
         
     except Exception as e:
         st.error(f"Error estimating volume for {symbol}: {str(e)}")
         return 0
 
+# Update the price fetching in fetch_all_markets():
+# Replace the orderbook section with:
+try:
+    ticker = api_request_with_retry(info.all_mids)
+    price = float(ticker.get(symbol, 0))
+    if price == 0:
+        raise ValueError("No price data")
+except:
+    price = None
 @st.cache_data(ttl=60)
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid using the SDK"""
@@ -982,37 +996,24 @@ with tab5:
             except Exception as e:
                 st.error(f"Failed to clear cache: {str(e)}")
 
-# Tab 6: Debug Information
-with tab6:
-    st.header("Debug Information")
-    
-    # Hyperliquid Info
-    st.subheader("Hyperliquid Connection Info")
-    
-    # Test Hyperliquid connection
-    if st.button("Test Hyperliquid Connection"):
-        try:
-            # Get exchange status
-            meta = info.meta()
-            
-            st.success("Hyperliquid connection established")
-            st.write(f"Total markets: {len(meta['universe'])}")
-            
-            # Show sample market details
-            if len(meta['universe']) > 0:
-                sample_symbol = meta['universe'][0]['name']
-                st.write(f"Sample market: {sample_symbol}")
-                
-                # Show sample order book
-                orderbook = info.orderbook(sample_symbol)
-                st.write(f"Order book data for {sample_symbol}:")
-                st.json({
-                    'bids': orderbook['bids'][:2] if 'bids' in orderbook else [],
-                    'asks': orderbook['asks'][:2] if 'asks' in orderbook else []
-                })
+
+# In Tab 6: Debug Information
+if st.button("Test Hyperliquid Connection"):
+    try:
+        meta = info.meta()
+        st.success("Hyperliquid connection established")
+        st.write(f"Total markets: {len(meta['universe'])}")
         
-        except Exception as e:
-            st.error(f"Hyperliquid connection test failed: {str(e)}")
+        if len(meta['universe']) > 0:
+            sample_symbol = meta['universe'][0]['name']
+            st.write(f"Sample market: {sample_symbol}")
+            
+            # Show sample price data instead of orderbook
+            ticker = info.all_mids()
+            st.write(f"Current mid price: {ticker.get(sample_symbol, 'N/A')}")
+            
+    except Exception as e:
+        st.error(f"Hyperliquid connection test failed: {str(e)}")
     
     # Show debug info
     if st.session_state.debug_info:
