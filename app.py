@@ -497,6 +497,34 @@ with st.sidebar:
         rate_limiter.calls_per_second = api_calls_per_second
     
     FUNDING_THRESHOLD = st.slider("Funding Rate Threshold (basis points)", 10, 200, 60, 5)
+    # Add to the sidebar section
+with st.sidebar:
+    # ... existing code ...
+    
+    # Add debug mode toggle
+    with st.expander("Debugging Tools"):
+        st.session_state.debug_mode = st.checkbox("Enable Debug Mode", value=False)
+        
+        if st.session_state.debug_mode:
+            st.warning("Debug Mode is ON - This may slow down the application")
+            
+            # Debug options
+            st.session_state.log_api_responses = st.checkbox("Log API Responses", value=True)
+            st.session_state.force_include_major = st.checkbox("Force Include Major Coins", value=True)
+            
+            # Debug thresholds
+            debug_min_liquidity = st.number_input(
+                "Debug Min Liquidity",
+                min_value=1000,
+                max_value=100000,
+                value=5000,
+                step=1000
+            )
+            
+            if st.button("Apply Debug Settings"):
+                global MIN_LIQUIDITY
+                MIN_LIQUIDITY = debug_min_liquidity
+                st.success(f"Applied debug settings. Min liquidity now: ${MIN_LIQUIDITY:,}")
 
 class ForwardTester:
     def __init__(self):
@@ -1080,23 +1108,57 @@ with tab5:
                 st.error(f"Failed to clear cache: {str(e)}")
 
 
-# In Tab 6: Debug Information
-if st.button("Test Hyperliquid Connection"):
-    try:
-        meta = info.meta()
-        st.success("Hyperliquid connection established")
-        st.write(f"Total markets: {len(meta['universe'])}")
-        
-        if len(meta['universe']) > 0:
-            sample_symbol = meta['universe'][0]['name']
-            st.write(f"Sample market: {sample_symbol}")
+# Replace the debug tab content with this
+with tab6:
+    st.header("Debug Information")
+    
+    # Add toggle for debug mode
+    debug_enabled = st.checkbox("Enable Debug Mode", value=st.session_state.get('debug_mode', False))
+    if debug_enabled != st.session_state.get('debug_mode', False):
+        st.session_state.debug_mode = debug_enabled
+        st.success(f"Debug mode {'enabled' if debug_enabled else 'disabled'}")
+        st.experimental_rerun()
+    
+    # Connection test
+    if st.button("Test Hyperliquid Connection"):
+        try:
+            meta = info.meta()
+            st.success("✅ Hyperliquid connection established")
+            st.write(f"Total markets: {len(meta['universe'])}")
             
-            # Show sample price data instead of orderbook
-            ticker = info.all_mids()
-            st.write(f"Current mid price: {ticker.get(sample_symbol, 'N/A')}")
-            
-    except Exception as e:
-        st.error(f"Hyperliquid connection test failed: {str(e)}")
+            if len(meta['universe']) > 0:
+                sample_symbol = meta['universe'][0]['name']
+                st.write(f"Sample market: {sample_symbol}")
+                
+                # Show sample price data
+                ticker = info.all_mids()
+                st.write(f"Current mid price: {ticker.get(sample_symbol, 'N/A')}")
+                
+                # Test orderbook
+                try:
+                    book = info.l2_snapshot(sample_symbol)
+                    if book and 'levels' in book and book['levels']:
+                        st.success(f"✅ Successfully fetched orderbook for {sample_symbol}")
+                        
+                        # Count bids and asks
+                        bids = [level for level in book['levels'] if level[0] == 'b']
+                        asks = [level for level in book['levels'] if level[0] == 'a']
+                        
+                        st.write(f"Found {len(bids)} bids and {len(asks)} asks")
+                        
+                        # Show top bid and ask
+                        if bids:
+                            st.write(f"Top bid: {bids[0]}")
+                        if asks:
+                            st.write(f"Top ask: {asks[0]}")
+                            
+                    else:
+                        st.error(f"❌ Failed to fetch valid orderbook for {sample_symbol}")
+                except Exception as e:
+                    st.error(f"❌ Orderbook test failed: {str(e)}")
+                
+        except Exception as e:
+            st.error(f"❌ Hyperliquid connection test failed: {str(e)}")
     
     # Show debug info
     if st.session_state.debug_info:
@@ -1118,6 +1180,11 @@ if st.button("Test Hyperliquid Connection"):
         if 'BTC_details' in st.session_state.debug_info:
             st.subheader("BTC Market Details")
             st.json(st.session_state.debug_info['BTC_details'])
+            
+            # If available, show raw book data
+            if 'BTC_raw_book' in st.session_state.debug_info:
+                with st.expander("Raw BTC Orderbook Data"):
+                    st.code(st.session_state.debug_info['BTC_raw_book'])
         
         # Show skipped markets sample
         if 'skipped_samples' in st.session_state.debug_info and st.session_state.debug_info['skipped_samples']:
@@ -1127,9 +1194,14 @@ if st.button("Test Hyperliquid Connection"):
         # Show any errors
         errors = {k: v for k, v in st.session_state.debug_info.items() if 'error' in k.lower()}
         if errors:
-            st.subheader("Errors")
-            for k, v in errors.items():
-                st.error(f"{k}: {v}")
+            with st.expander("Error Details"):
+                for k, v in errors.items():
+                    st.error(f"{k}: {v}")
+        
+        # Add a raw response viewer if available
+        if 'sample_price_response' in st.session_state.debug_info:
+            with st.expander("Sample API Response"):
+                st.code(st.session_state.debug_info['sample_price_response'])
     
     # Cache status
     st.subheader("Cache Status")
@@ -1147,8 +1219,32 @@ if st.button("Test Hyperliquid Connection"):
         
         st.write(f"Markets in cache: {market_cache_count}")
         st.write(f"OHLCV data sets in cache: {ohlcv_cache_count}")
+        
+        if st.button("Clear All Cache"):
+            try:
+                conn = sqlite3.connect('market_cache.db')
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM market_cache")
+                cursor.execute("DELETE FROM ohlcv_cache")
+                conn.commit()
+                conn.close()
+                st.cache_data.clear()
+                st.success("✅ Cache cleared successfully")
+                st.info("Please scan markets again to refresh data")
+            except Exception as e:
+                st.error(f"❌ Failed to clear cache: {str(e)}")
     else:
         st.write("Cache database not found.")
-
+        
+    # Add a section for the rate limiter settings
+    st.subheader("Rate Limiter Settings")
+    current_rate = st.session_state.get('api_rate', rate_limiter.calls_per_second)
+    new_rate = st.slider("API calls per second", 1, 10, int(current_rate), 1)
+    
+    if new_rate != current_rate:
+        rate_limiter.calls_per_second = new_rate
+        st.session_state.api_rate = new_rate
+        st.success(f"Rate limiter updated to {new_rate} calls per second")
+        
 # Update timestamp in the footer
 st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
