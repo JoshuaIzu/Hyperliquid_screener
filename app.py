@@ -148,26 +148,38 @@ def estimate_volume_from_orderbook(trading_pair):
         if not levels:
             return 0
             
-        # Get top 5 levels
-        bids = [l for l in levels if l[0] == 'b'][:5]
-        asks = [l for l in levels if l[0] == 'a'][:5]
+        # Safely get top 5 levels with fallback for empty lists
+        bids = [l for l in levels if len(l) > 2 and l[0] == 'b'][:5] or []
+        asks = [l for l in levels if len(l) > 2 and l[0] == 'a'][:5] or []
         
         if not bids or not asks:
             return 0
             
-        # Calculate total liquidity
-        bid_liquidity = sum(float(l[2]) for l in bids)
-        ask_liquidity = sum(float(l[2]) for l in asks)
-        
-        # Get mid price
-        mid_price = (float(bids[0][1]) + float(asks[0][1])) / 2
-        
-        # Estimate daily volume
-        return (bid_liquidity + ask_liquidity) * mid_price * 10
-        
+        try:
+            # Calculate total liquidity with additional safety checks
+            bid_liquidity = sum(float(l[2]) for l in bids if len(l) > 2)
+            ask_liquidity = sum(float(l[2]) for l in asks if len(l) > 2)
+            
+            # Get prices with fallback
+            bid_price = float(bids[0][1]) if bids and len(bids[0]) > 1 else 0
+            ask_price = float(asks[0][1]) if asks and len(asks[0]) > 1 else 0
+            
+            if bid_price <= 0 or ask_price <= 0:
+                return 0
+                
+            mid_price = (bid_price + ask_price) / 2
+            
+            # Estimate daily volume (liquidity * price * turnover factor)
+            return (bid_liquidity + ask_liquidity) * mid_price * 10
+            
+        except (IndexError, ValueError, TypeError) as e:
+            st.warning(f"Order book structure issue for {trading_pair}: {str(e)}")
+            return 0
+            
     except Exception as e:
         st.error(f"Volume estimation error for {trading_pair}: {str(e)}")
-        return 0        
+        return 0
+        
 @st.cache_data(ttl=60)
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid using the SDK"""
@@ -603,7 +615,6 @@ def generate_signals(markets_df):
             'Mark Price': market['markPrice'],
             'Signal': signal,
             'Volume 24h': market['volume24h'],
-            'Open Interest': market['openInterest'],
             'Funding Rate': funding_rate,
             'Vol Surge': vol_surge,
             'Change 24h': market['change24h'],
