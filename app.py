@@ -138,34 +138,34 @@ def safe_float(value, default=0.0):
 
 # Then modify the estimate_volume_from_orderbook function:
 def estimate_volume_from_orderbook(symbol):
-    """Estimate 24h volume from orderbook liquidity using info.order_book()"""
+    """Estimate 24h volume from orderbook liquidity using current Hyperliquid API"""
     try:
-        # Get orderbook data using the correct API method
-        orderbook = api_request_with_retry(info.order_book, symbol)
+        # Get orderbook data using the current API method
+        book = api_request_with_retry(info.l2_snapshot, symbol)
         
-        # Validate orderbook structure
-        if not orderbook or not isinstance(orderbook, dict):
+        # Validate response structure
+        if not book or not isinstance(book, dict) or 'levels' not in book:
             return 0
             
-        # Extract bids and asks with proper error handling
-        bids = orderbook.get('bids', [])
-        asks = orderbook.get('asks', [])
+        levels = book.get('levels', [])
+        if not levels:
+            return 0
+            
+        # Extract bids and asks (levels are tuples where [0] is side, [1] is price, [2] is size)
+        bids = [level for level in levels if level[0] == 'b'][:5]  # Top 5 bids
+        asks = [level for level in levels if level[0] == 'a'][:5]  # Top 5 asks
         
         if not bids or not asks:
             return 0
             
-        # Take top 5 levels only
-        bids = bids[:5]
-        asks = asks[:5]
-        
         try:
             # Calculate total liquidity
-            bid_liquidity = sum(float(bid['sz']) for bid in bids)
-            ask_liquidity = sum(float(ask['sz']) for ask in asks)
+            bid_liquidity = sum(float(bid[2]) for bid in bids)
+            ask_liquidity = sum(float(ask[2]) for ask in asks)
             
             # Get prices from first levels
-            bid_price = float(bids[0]['px']) if bids else 0
-            ask_price = float(asks[0]['px']) if asks else 0
+            bid_price = float(bids[0][1])
+            ask_price = float(asks[0][1])
             
             # Validate prices
             if bid_price <= 0 or ask_price <= 0:
@@ -178,14 +178,13 @@ def estimate_volume_from_orderbook(symbol):
             
             return volume if volume > 0 else 0
             
-        except (KeyError, ValueError, TypeError) as e:
+        except (IndexError, ValueError, TypeError) as e:
             st.warning(f"Order book structure issue for {symbol}: {str(e)}")
             return 0
             
     except Exception as e:
         st.error(f"Volume estimation error for {symbol}: {str(e)}")
-        return 0
-        
+        return 0        
 @st.cache_data(ttl=60)
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid using the SDK"""
