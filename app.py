@@ -137,10 +137,10 @@ def safe_float(value, default=0.0):
         return default
 
 # Then modify the estimate_volume_from_orderbook function:
-def estimate_volume_from_orderbook(symbol):
+def estimate_volume_from_orderbook(trading_pair):
     """Estimate 24h volume from orderbook liquidity"""
     try:
-        book = api_request_with_retry(info.l2_snapshot, symbol)
+        book = api_request_with_retry(info.l2_snapshot, trading_pair)
         if not book or 'levels' not in book:
             return 0
             
@@ -162,20 +162,17 @@ def estimate_volume_from_orderbook(symbol):
         # Get mid price
         mid_price = (float(bids[0][1]) + float(asks[0][1])) / 2
         
-        # Estimate daily volume (liquidity * price * turnover factor)
+        # Estimate daily volume
         return (bid_liquidity + ask_liquidity) * mid_price * 10
         
     except Exception as e:
-        st.error(f"Volume estimation error for {symbol}: {str(e)}")
-        return 0   
-        
+        st.error(f"Volume estimation error for {trading_pair}: {str(e)}")
+        return 0        
 @st.cache_data(ttl=60)
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid using the SDK"""
     try:
         debug_info = {}
-        
-        # Load all markets from Hyperliquid
         meta = api_request_with_retry(info.meta)
         debug_info['total_markets'] = len(meta['universe'])
         
@@ -192,6 +189,9 @@ def fetch_all_markets():
         
         for i, coin in enumerate(meta['universe']):
             symbol = coin['name']
+            # Create the full trading pair symbol
+            trading_pair = f"{symbol}/USDC:USDC"  # This is the format Hyperliquid expects
+            
             try:
                 # Update progress
                 progress_pct = (i + 1) / len(meta['universe'])
@@ -208,8 +208,10 @@ def fetch_all_markets():
                     })
                     continue
                 
-                # Estimate volume (simplified approach)
-                volume_24h = estimate_volume_from_orderbook(symbol)
+                # Estimate volume using trading_pair format
+                volume_24h = estimate_volume_from_orderbook(trading_pair)
+                
+                # ... rest of the existing function code ...
                 
                 # Get funding rate
                 funding_rate = 0
