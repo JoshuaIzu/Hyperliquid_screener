@@ -198,6 +198,25 @@ def estimate_volume_from_orderbook(symbol):
             mid_price = (bid_price + ask_price) / 2
             volume = (bid_liquidity + ask_liquidity) * mid_price * 10
             
+            # Add your fallback code here
+            if volume == 0:
+                # Fallback to simple spread-based estimation
+                try:
+                    spread = (ask_price - bid_price) / mid_price
+                    if spread < 0.1:  # Only use if spread is reasonable
+                        volume = (bid_liquidity + ask_liquidity) * mid_price * 5  # Lower multiplier
+                except:
+                    pass
+                    
+            if st.session_state.get('debug_mode'):
+                st.write(f"Orderbook for {symbol}:")
+                st.json({
+                    'bids': bids[:3],
+                    'asks': asks[:3],
+                    'valid_bids': len(bids),
+                    'valid_asks': len(asks)
+                })
+            
             return volume if volume > 0 else 0
             
         except (IndexError, ValueError, TypeError) as e:
