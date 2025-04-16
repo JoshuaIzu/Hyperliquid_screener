@@ -226,7 +226,7 @@ def estimate_volume_from_orderbook(symbol):
     except Exception as e:
         st.error(f"Volume estimation failed for {symbol}: {str(e)}")
         return 0
-      
+        
 @st.cache_data(ttl=60)
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid using the SDK"""
@@ -265,8 +265,36 @@ def fetch_all_markets():
                 # Estimate volume using just the symbol
                 volume_24h = estimate_volume_from_orderbook(symbol)
                 
-                # ... rest of your existing code ...                
-                # ... rest of the existing function code ...
+                # Apply fallback if volume is too low
+                if volume_24h == 0:
+                    # Try to get orderbook data again for fallback calculation
+                    try:
+                        book = api_request_with_retry(info.l2_snapshot, symbol)
+                        if book and 'levels' in book:
+                            bids = [level for level in book['levels'] if level[0] == 'b']
+                            asks = [level for level in book['levels'] if level[0] == 'a']
+                            
+                            if bids and asks:
+                                bid_price = float(bids[0][1])
+                                ask_price = float(asks[0][1])
+                                bid_liquidity = sum(float(bid[2]) for bid in bids[:5])
+                                ask_liquidity = sum(float(ask[2]) for ask in asks[:5])
+                                
+                                mid_price = (bid_price + ask_price) / 2
+                                spread = (ask_price - bid_price) / mid_price
+                                
+                                if spread < 0.1:  # Only use if spread is reasonable
+                                    volume_24h = (bid_liquidity + ask_liquidity) * mid_price * 5  # Lower multiplier
+                    except Exception as e:
+                        debug_info[f'fallback_error_{symbol}'] = str(e)
+                
+                # Save BTC and ETH details for debugging
+                if symbol in ["BTC", "ETH"]:
+                    debug_info[f'{symbol}_details'] = {
+                        'price': price,
+                        'volume24h': volume_24h,
+                        'threshold': MIN_LIQUIDITY
+                    }
                 
                 # Get funding rate
                 funding_rate = 0
@@ -277,8 +305,7 @@ def fetch_all_markets():
                 except Exception as e:
                     debug_info[f'funding_error_{symbol}'] = str(e)
                 
-                
-                # Skip if below liquidity threshold
+                # Skip if below liquidity threshold - MOVED AFTER VOLUME CALCULATION
                 if volume_24h < MIN_LIQUIDITY:
                     skipped_markets.append({
                         'symbol': symbol,
@@ -306,7 +333,7 @@ def fetch_all_markets():
                     'markPrice': price,
                     'lastPrice': price,
                     'fundingRate': funding_rate,
-                    'volume24h': volume_24h,
+                    'volume24h': volume_24h,  # Ensure this key exactly matches what's expected later
                     'change24h': change_24h,
                 })
                 
@@ -321,17 +348,32 @@ def fetch_all_markets():
         # Create DataFrame
         df = pd.DataFrame(market_data)
         
+        # Add additional debugging info in case of empty results
+        if df.empty or len(df) == 0:
+            debug_info['empty_result'] = True
+            debug_info['min_liquidity'] = MIN_LIQUIDITY
+            st.warning(f"No markets met the minimum liquidity threshold of ${MIN_LIQUIDITY:,}. Consider lowering the threshold.")
+        else:
+            # Check for the presence of 'volume24h' column
+            if 'volume24h' not in df.columns:
+                debug_info['missing_volume_column'] = True
+                debug_info['actual_columns'] = list(df.columns)
+        
         # Save debug info
         debug_info['markets_processed'] = len(market_data)
         debug_info['markets_skipped'] = len(skipped_markets)
         debug_info['skipped_samples'] = skipped_markets[:5]
         st.session_state.debug_info = debug_info
         
-        return df.sort_values('volume24h', ascending=False)
+        if not df.empty:
+            return df.sort_values('volume24h', ascending=False)
+        else:
+            # Return an empty DataFrame with the expected columns
+            return pd.DataFrame(columns=['symbol', 'markPrice', 'lastPrice', 'fundingRate', 'volume24h', 'change24h'])
         
     except Exception as e:
         st.error(f"Error fetching markets: {str(e)}")
-        return pd.DataFrame()
+        return pd.DataFrame()      
 @st.cache_data(ttl=300)
 def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
     """Fetch OHLCV data for a specific symbol using Hyperliquid SDK"""
