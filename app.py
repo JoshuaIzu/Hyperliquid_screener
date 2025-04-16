@@ -137,47 +137,42 @@ def safe_float(value, default=0.0):
         return default
 
 # Then modify the estimate_volume_from_orderbook function:
-def estimate_volume_from_orderbook(trading_pair):
+def estimate_volume_from_orderbook(symbol):
     """Estimate 24h volume from orderbook liquidity"""
     try:
-        book = api_request_with_retry(info.l2_snapshot, trading_pair)
+        # Use just the base symbol (e.g., "BTC" instead of "BTC/USDC:USDC")
+        book = api_request_with_retry(info.l2_snapshot, symbol)
         if not book or 'levels' not in book:
             return 0
             
-        levels = book['levels']
+        levels = book.get('levels', [])
         if not levels:
             return 0
             
-        # Safely get top 5 levels with fallback for empty lists
-        bids = [l for l in levels if len(l) > 2 and l[0] == 'b'][:5] or []
-        asks = [l for l in levels if len(l) > 2 and l[0] == 'a'][:5] or []
+        # Safely get top levels
+        bids = [l for l in levels if l[0] == 'b'][:5] if levels else []
+        asks = [l for l in levels if l[0] == 'a'][:5] if levels else []
         
         if not bids or not asks:
             return 0
             
         try:
-            # Calculate total liquidity with additional safety checks
-            bid_liquidity = sum(float(l[2]) for l in bids if len(l) > 2)
-            ask_liquidity = sum(float(l[2]) for l in asks if len(l) > 2)
+            # Calculate total liquidity
+            bid_liquidity = sum(float(l[2]) for l in bids)
+            ask_liquidity = sum(float(l[2]) for l in asks)
             
-            # Get prices with fallback
-            bid_price = float(bids[0][1]) if bids and len(bids[0]) > 1 else 0
-            ask_price = float(asks[0][1]) if asks and len(asks[0]) > 1 else 0
+            # Get mid price
+            mid_price = (float(bids[0][1]) + float(asks[0][1])) / 2
             
-            if bid_price <= 0 or ask_price <= 0:
-                return 0
-                
-            mid_price = (bid_price + ask_price) / 2
-            
-            # Estimate daily volume (liquidity * price * turnover factor)
+            # Estimate daily volume
             return (bid_liquidity + ask_liquidity) * mid_price * 10
             
-        except (IndexError, ValueError, TypeError) as e:
-            st.warning(f"Order book structure issue for {trading_pair}: {str(e)}")
+        except (IndexError, ValueError) as e:
+            st.warning(f"Order book structure issue for {symbol}: {str(e)}")
             return 0
             
     except Exception as e:
-        st.error(f"Volume estimation error for {trading_pair}: {str(e)}")
+        st.error(f"Volume estimation error for {symbol}: {str(e)}")
         return 0
         
 @st.cache_data(ttl=60)
@@ -188,29 +183,24 @@ def fetch_all_markets():
         meta = api_request_with_retry(info.meta)
         debug_info['total_markets'] = len(meta['universe'])
         
-        # Get all mid prices at once (more efficient)
+        # Get all mid prices at once
         all_prices = api_request_with_retry(info.all_mids)
         
-        # Process market data
         market_data = []
         skipped_markets = []
         
-        # Progress tracking
         progress = st.progress(0)
         status = st.empty()
         
         for i, coin in enumerate(meta['universe']):
-            symbol = coin['name']
-            # Create the full trading pair symbol
-            trading_pair = f"{symbol}/USDC:USDC"  # This is the format Hyperliquid expects
+            symbol = coin['name']  # This is the correct symbol format
             
             try:
                 # Update progress
-                progress_pct = (i + 1) / len(meta['universe'])
-                progress.progress(progress_pct)
+                progress.progress((i + 1) / len(meta['universe']))
                 status.text(f"Processing {i+1}/{len(meta['universe'])}: {symbol}")
                 
-                # Get price from all_mids
+                # Get price
                 price = safe_float(all_prices.get(symbol))
                 if not price:
                     skipped_markets.append({
@@ -220,9 +210,10 @@ def fetch_all_markets():
                     })
                     continue
                 
-                # Estimate volume using trading_pair format
-                volume_24h = estimate_volume_from_orderbook(trading_pair)
+                # Estimate volume using just the symbol
+                volume_24h = estimate_volume_from_orderbook(symbol)
                 
+                # ... rest of your existing code ...                
                 # ... rest of the existing function code ...
                 
                 # Get funding rate
