@@ -138,53 +138,76 @@ def safe_float(value, default=0.0):
 
 # Then modify the estimate_volume_from_orderbook function:
 def estimate_volume_from_orderbook(symbol):
-    """Estimate 24h volume from orderbook liquidity using current Hyperliquid API"""
+    """Ultra-robust 24h volume estimation with complete error handling"""
     try:
-        # Get orderbook data using the current API method
+        # 1. Get orderbook data with retry
         book = api_request_with_retry(info.l2_snapshot, symbol)
         
-        # Validate response structure
-        if not book or not isinstance(book, dict) or 'levels' not in book:
+        # 2. Validate complete response structure
+        if (not book or not isinstance(book, dict) or 
+            'levels' not in book or 
+            not isinstance(book['levels'], list)):
             return 0
             
-        levels = book.get('levels', [])
-        if not levels:
+        levels = book['levels']
+        if len(levels) < 2:  # Need at least one bid and one ask
             return 0
             
-        # Extract bids and asks (levels are tuples where [0] is side, [1] is price, [2] is size)
-        bids = [level for level in levels if level[0] == 'b'][:5]  # Top 5 bids
-        asks = [level for level in levels if level[0] == 'a'][:5]  # Top 5 asks
+        # 3. Safely extract bids and asks with comprehensive validation
+        bids = []
+        asks = []
         
+        for level in levels:
+            try:
+                if (isinstance(level, list) and len(level) >= 3 and 
+                    level[0] in ['b', 'a'] and 
+                    isinstance(level[1], (str, float, int)) and 
+                    isinstance(level[2], (str, float, int))):
+                    
+                    if level[0] == 'b':
+                        bids.append(level)
+                    else:
+                        asks.append(level)
+            except (IndexError, TypeError):
+                continue
+        
+        # 4. Validate we have at least one valid bid and ask
         if not bids or not asks:
             return 0
             
+        # 5. Take top levels with additional safety checks
+        top_bids = sorted(bids, key=lambda x: -float(x[1]))[:5]
+        top_asks = sorted(asks, key=lambda x: float(x[1]))[:5]
+        
         try:
-            # Calculate total liquidity
-            bid_liquidity = sum(float(bid[2]) for bid in bids)
-            ask_liquidity = sum(float(ask[2]) for ask in asks)
+            # 6. Calculate total liquidity with fallbacks
+            bid_liquidity = sum(max(0, float(bid[2])) for bid in top_bids if len(bid) > 2)
+            ask_liquidity = sum(max(0, float(ask[2])) for ask in top_asks if len(ask) > 2)
             
-            # Get prices from first levels
-            bid_price = float(bids[0][1])
-            ask_price = float(asks[0][1])
+            # 7. Get prices with multiple fallbacks
+            bid_price = float(top_bids[0][1]) if top_bids and len(top_bids[0]) > 1 else 0
+            ask_price = float(top_asks[0][1]) if top_asks and len(top_asks[0]) > 1 else 0
             
-            # Validate prices
-            if bid_price <= 0 or ask_price <= 0:
+            # 8. Final validation
+            if (bid_price <= 0 or ask_price <= 0 or 
+                bid_liquidity <= 0 or ask_liquidity <= 0 or
+                bid_price > ask_price * 100 or ask_price < bid_price / 100):  # Sanity check
                 return 0
                 
+            # 9. Calculate volume estimate
             mid_price = (bid_price + ask_price) / 2
-            
-            # Estimate daily volume (liquidity * price * turnover factor)
             volume = (bid_liquidity + ask_liquidity) * mid_price * 10
             
             return volume if volume > 0 else 0
             
         except (IndexError, ValueError, TypeError) as e:
-            st.warning(f"Order book structure issue for {symbol}: {str(e)}")
+            st.warning(f"Order book processing error for {symbol}: {str(e)}")
             return 0
             
     except Exception as e:
-        st.error(f"Volume estimation error for {symbol}: {str(e)}")
-        return 0        
+        st.error(f"Volume estimation failed for {symbol}: {str(e)}")
+        return 0
+      
 @st.cache_data(ttl=60)
 def fetch_all_markets():
     """Fetch all perpetual contracts from Hyperliquid using the SDK"""
