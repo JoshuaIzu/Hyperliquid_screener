@@ -138,36 +138,47 @@ def safe_float(value, default=0.0):
 
 # Then modify the estimate_volume_from_orderbook function:
 def estimate_volume_from_orderbook(symbol):
-    """Estimate 24h volume from orderbook liquidity"""
+    """Estimate 24h volume from orderbook liquidity using info.order_book()"""
     try:
-        # Use just the base symbol (e.g., "BTC" instead of "BTC/USDC:USDC")
-        book = api_request_with_retry(info.l2_snapshot, symbol)
-        if not book or 'levels' not in book:
+        # Get orderbook data using the correct API method
+        orderbook = api_request_with_retry(info.order_book, symbol)
+        
+        # Validate orderbook structure
+        if not orderbook or not isinstance(orderbook, dict):
             return 0
             
-        levels = book.get('levels', [])
-        if not levels:
-            return 0
-            
-        # Safely get top levels
-        bids = [l for l in levels if l[0] == 'b'][:5] if levels else []
-        asks = [l for l in levels if l[0] == 'a'][:5] if levels else []
+        # Extract bids and asks with proper error handling
+        bids = orderbook.get('bids', [])
+        asks = orderbook.get('asks', [])
         
         if not bids or not asks:
             return 0
             
+        # Take top 5 levels only
+        bids = bids[:5]
+        asks = asks[:5]
+        
         try:
             # Calculate total liquidity
-            bid_liquidity = sum(float(l[2]) for l in bids)
-            ask_liquidity = sum(float(l[2]) for l in asks)
+            bid_liquidity = sum(float(bid['sz']) for bid in bids)
+            ask_liquidity = sum(float(ask['sz']) for ask in asks)
             
-            # Get mid price
-            mid_price = (float(bids[0][1]) + float(asks[0][1])) / 2
+            # Get prices from first levels
+            bid_price = float(bids[0]['px']) if bids else 0
+            ask_price = float(asks[0]['px']) if asks else 0
             
-            # Estimate daily volume
-            return (bid_liquidity + ask_liquidity) * mid_price * 10
+            # Validate prices
+            if bid_price <= 0 or ask_price <= 0:
+                return 0
+                
+            mid_price = (bid_price + ask_price) / 2
             
-        except (IndexError, ValueError) as e:
+            # Estimate daily volume (liquidity * price * turnover factor)
+            volume = (bid_liquidity + ask_liquidity) * mid_price * 10
+            
+            return volume if volume > 0 else 0
+            
+        except (KeyError, ValueError, TypeError) as e:
             st.warning(f"Order book structure issue for {symbol}: {str(e)}")
             return 0
             
