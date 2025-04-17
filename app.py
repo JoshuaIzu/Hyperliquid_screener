@@ -26,6 +26,7 @@ st.markdown("Track and analyze cryptocurrency futures markets on Hyperliquid")
 BASE_VOL = 0.35
 VOL_MULTIPLIER = 1.5
 MIN_LIQUIDITY = 50000  # Lower default to 50k
+global MIN_LIQUIDITY 
 FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
 
 # Initialize Hyperliquid Info client
@@ -522,7 +523,6 @@ with st.sidebar:
             )
             
             if st.button("Apply Debug Settings"):
-                global MIN_LIQUIDITY
                 MIN_LIQUIDITY = debug_min_liquidity
                 st.success(f"Applied debug settings. Min liquidity now: ${MIN_LIQUIDITY:,}")
 
