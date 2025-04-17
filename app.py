@@ -505,24 +505,44 @@ with st.sidebar:
     # ... existing code ...
     
     # Add debug mode toggle
-    with st.expander("Debugging Tools"):
-        st.session_state.debug_mode = st.checkbox("Enable Debug Mode", value=False)
+   with st.expander("Debugging Tools"):
+    # Initialize debug mode if not set
+    if 'debug_mode' not in st.session_state:
+        st.session_state.debug_mode = False
+    
+    # Main debug toggle with unique key
+    debug_enabled = st.checkbox(
+        "Enable Debug Mode",
+        value=st.session_state.debug_mode,
+        key="debug_mode_toggle",
+        on_change=lambda: st.session_state.update(debug_mode=not st.session_state.debug_mode)
+    )
+    
+    if st.session_state.debug_mode:
+        st.warning("Debug Mode is ON - This may slow down the application")
         
-        if st.session_state.debug_mode:
-            st.warning("Debug Mode is ON - This may slow down the application")
-            
-            # Debug options
-            st.session_state.log_api_responses = st.checkbox("Log API Responses", value=True)
-            st.session_state.force_include_major = st.checkbox("Force Include Major Coins", value=True)
-            
-            # Debug thresholds
-            debug_min_liquidity = st.number_input(
-                "Debug Min Liquidity",
-                min_value=1000,
-                max_value=100000,
-                value=5000,
-                step=1000
-            )
+        # Debug options with unique keys
+        st.session_state.log_api_responses = st.checkbox(
+            "Log API Responses",
+            value=True,
+            key="log_api_responses_checkbox"
+        )
+        
+        st.session_state.force_include_major = st.checkbox(
+            "Force Include Major Coins",
+            value=True,
+            key="force_include_major_checkbox"
+        )
+        
+        # Debug thresholds with unique key
+        debug_min_liquidity = st.number_input(
+            "Debug Min Liquidity",
+            min_value=1000,
+            max_value=100000,
+            value=5000,
+            step=1000,
+            key="debug_min_liquidity_input"
+        )
             
             if st.button("Apply Debug Settings"):
                 st.session_state.MIN_LIQUIDITY = debug_min_liquidity
@@ -1114,13 +1134,18 @@ with tab5:
 with tab6:
     st.header("Debug Information")
     
-    # Add toggle for debug mode
-    debug_enabled = st.checkbox("Enable Debug Mode", value=st.session_state.get('debug_mode', False))
-    if debug_enabled != st.session_state.get('debug_mode', False):
-        st.session_state.debug_mode = debug_enabled
-        st.success(f"Debug mode {'enabled' if debug_enabled else 'disabled'}")
-        st.experimental_rerun()
+    # Add toggle for debug mode with unique key
+    debug_enabled = st.checkbox(
+        "Enable Debug Mode",
+        value=st.session_state.get('debug_mode', False),
+        key="debug_tab_toggle",  # Unique key for this instance
+        on_change=lambda: st.session_state.update(debug_mode=not st.session_state.debug_mode)
+    )
     
+    # Show status message without forcing rerun
+    if debug_enabled != st.session_state.get('debug_mode_prev', None):
+        st.session_state.debug_mode_prev = debug_enabled
+        st.success(f"Debug mode {'enabled' if debug_enabled else 'disabled'}")
     # Connection test
     if st.button("Test Hyperliquid Connection"):
         try:
