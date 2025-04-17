@@ -23,10 +23,13 @@ st.title("📈 Hyperliquid Futures Market Screener")
 st.markdown("Track and analyze cryptocurrency futures markets on Hyperliquid")
 
 # Configuration
+# Configuration
 BASE_VOL = 0.35
 VOL_MULTIPLIER = 1.5
-MIN_LIQUIDITY = 50000  # Lower default to 50k 
-FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
+MIN_LIQUIDITY = 50000  # Fallback value (optional)
+if 'MIN_LIQUIDITY' not in st.session_state:
+    st.session_state.MIN_LIQUIDITY = MIN_LIQUIDITY  # Sync with global var
+FUNDING_THRESHOLD = 60 # Annualized funding rate threshold (in basis points)
 
 # Initialize Hyperliquid Info client
 @st.cache_resource
@@ -522,9 +525,8 @@ with st.sidebar:
             )
             
             if st.button("Apply Debug Settings"):
-                global MIN_LIQUIDITY
-                MIN_LIQUIDITY = debug_min_liquidity
-                st.success(f"Applied debug settings. Min liquidity now: ${MIN_LIQUIDITY:,}")
+                st.session_state.MIN_LIQUIDITY = debug_min_liquidity
+                st.success(f"Applied debug settings. Min liquidity now: ${st.session_state.MIN_LIQUIDITY:,}")
 
 class ForwardTester:
     def __init__(self):
