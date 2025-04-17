@@ -522,8 +522,8 @@ with st.sidebar:
             )
             
             if st.button("Apply Debug Settings"):
-                MIN_LIQUIDITY = debug_min_liquidity
                 global MIN_LIQUIDITY
+                MIN_LIQUIDITY = debug_min_liquidity
                 st.success(f"Applied debug settings. Min liquidity now: ${MIN_LIQUIDITY:,}")
 
 class ForwardTester:
