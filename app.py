@@ -23,7 +23,6 @@ st.title("📈 Hyperliquid Futures Market Screener")
 st.markdown("Track and analyze cryptocurrency futures markets on Hyperliquid")
 
 # Configuration
-# Configuration
 BASE_VOL = 0.35
 VOL_MULTIPLIER = 1.5
 MIN_LIQUIDITY = 50000  # Fallback value (optional)
@@ -114,6 +113,14 @@ def save_state_to_db(active_trades, completed_trades):
     conn = sqlite3.connect('trading_state.db')
     cursor = conn.cursor()
     
+    # Create table if it doesn't exist
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS app_state (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    ''')
+    
     # Save active trades
     cursor.execute('''
     INSERT OR REPLACE INTO app_state (key, value)
@@ -139,7 +146,6 @@ def safe_float(value, default=0.0):
     except (ValueError, TypeError):
         return default
 
-# Then modify the estimate_volume_from_orderbook function:
 def estimate_volume_from_orderbook(symbol):
     """Ultra-robust 24h volume estimation with complete error handling"""
     try:
@@ -500,53 +506,49 @@ with st.sidebar:
         rate_limiter.calls_per_second = api_calls_per_second
     
     FUNDING_THRESHOLD = st.slider("Funding Rate Threshold (basis points)", 10, 200, 60, 5)
-    # Add to the sidebar section
-with st.sidebar:
-    # ... existing code ...
     
-    # Add debug mode toggle
-   with st.expander("Debugging Tools"):
-    # Initialize debug mode if not set
-    if 'debug_mode' not in st.session_state:
-        st.session_state.debug_mode = False
-    
-    # Main debug toggle with unique key
-    debug_enabled = st.checkbox(
-        "Enable Debug Mode",
-        value=st.session_state.debug_mode,
-        key="debug_mode_toggle",
-        on_change=lambda: st.session_state.update(debug_mode=not st.session_state.debug_mode)
-    )
-    
-    if st.session_state.debug_mode:
-        st.warning("Debug Mode is ON - This may slow down the application")
+    with st.expander("Debugging Tools"):
+        # Initialize debug mode if not set
+        if 'debug_mode' not in st.session_state:
+            st.session_state.debug_mode = False
         
-        # Debug options with unique keys
-        st.session_state.log_api_responses = st.checkbox(
-            "Log API Responses",
-            value=True,
-            key="log_api_responses_checkbox"
+        # Main debug toggle with unique key
+        debug_enabled = st.checkbox(
+            "Enable Debug Mode",
+            value=st.session_state.debug_mode,
+            key="debug_mode_toggle",
+            on_change=lambda: st.session_state.update(debug_mode=not st.session_state.debug_mode)
         )
         
-        st.session_state.force_include_major = st.checkbox(
-            "Force Include Major Coins",
-            value=True,
-            key="force_include_major_checkbox"
-        )
-        
-        # Debug thresholds with unique key
-        debug_min_liquidity = st.number_input(
-            "Debug Min Liquidity",
-            min_value=1000,
-            max_value=100000,
-            value=5000,
-            step=1000,
-            key="debug_min_liquidity_input"
-        )
-        
-        if st.button("Apply Debug Settings"):
-            st.session_state.MIN_LIQUIDITY = debug_min_liquidity
-            st.success(f"Applied debug settings. Min liquidity now: ${st.session_state.MIN_LIQUIDITY:,}")
+        if st.session_state.debug_mode:
+            st.warning("Debug Mode is ON - This may slow down the application")
+            
+            # Debug options with unique keys
+            st.session_state.log_api_responses = st.checkbox(
+                "Log API Responses",
+                value=True,
+                key="log_api_responses_checkbox"
+            )
+            
+            st.session_state.force_include_major = st.checkbox(
+                "Force Include Major Coins",
+                value=True,
+                key="force_include_major_checkbox"
+            )
+            
+            # Debug thresholds with unique key
+            debug_min_liquidity = st.number_input(
+                "Debug Min Liquidity",
+                min_value=1000,
+                max_value=100000,
+                value=5000,
+                step=1000,
+                key="debug_min_liquidity_input"
+            )
+            
+            if st.button("Apply Debug Settings"):
+                st.session_state.MIN_LIQUIDITY = debug_min_liquidity
+                st.success(f"Applied debug settings. Min liquidity now: ${st.session_state.MIN_LIQUIDITY:,}")
 
 class ForwardTester:
     def __init__(self):
@@ -680,7 +682,7 @@ def init_market_cache():
     conn = sqlite3.connect('market_cache.db')
     cursor = conn.cursor()
     
-    # Create markets table if it doesn't exist
+    # Create table if it doesn't exist
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS market_cache (
         symbol TEXT PRIMARY KEY,
@@ -1129,8 +1131,7 @@ with tab5:
             except Exception as e:
                 st.error(f"Failed to clear cache: {str(e)}")
 
-
-# Replace the debug tab content with this
+# Tab 6: Debug Information
 with tab6:
     st.header("Debug Information")
     
