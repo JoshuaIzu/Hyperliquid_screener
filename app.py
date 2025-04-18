@@ -543,10 +543,10 @@ with st.sidebar:
             step=1000,
             key="debug_min_liquidity_input"
         )
-            
-            if st.button("Apply Debug Settings"):
-                st.session_state.MIN_LIQUIDITY = debug_min_liquidity
-                st.success(f"Applied debug settings. Min liquidity now: ${st.session_state.MIN_LIQUIDITY:,}")
+        
+        if st.button("Apply Debug Settings"):
+            st.session_state.MIN_LIQUIDITY = debug_min_liquidity
+            st.success(f"Applied debug settings. Min liquidity now: ${st.session_state.MIN_LIQUIDITY:,}")
 
 class ForwardTester:
     def __init__(self):
