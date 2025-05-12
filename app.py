@@ -219,9 +219,8 @@ def fetch_all_markets():
         
         progress = st.progress(0)
         status = st.empty()
-        
-        for i, coin in enumerate(meta.universe):
-            symbol = coin.name
+          for i, coin in enumerate(meta.universe):
+            symbol = coin['name']  # Access name using dictionary syntax
             
             try:
                 progress.progress((i + 1) / len(meta.universe))
@@ -541,14 +540,20 @@ def generate_signals(markets_df):
     for i, (index, market) in enumerate(top_markets.iterrows()):
         symbol = market['symbol']
         status_text.text(f"Analyzing {symbol}... ({i+1}/{total_markets})")
-        
-        df = fetch_hyperliquid_candles(symbol, interval='1h', limit=48)
+          df = fetch_hyperliquid_candles(symbol, interval='1h', limit=48)
         if df is None or len(df) < 6:
             continue
             
+        # Calculate volume metrics with consistency check
+        recent_vols = df['volume'].tail(3)  # Last 3 hours
         avg_vol = df['volume'].mean()
-        recent_vol = df['volume'].iloc[-1]
+        recent_vol = recent_vols.mean()  # Average of last 3 hours
         vol_surge = recent_vol / avg_vol if avg_vol > 0 else 0
+        
+        # Calculate volatility for dynamic TP/SL
+        df['hlrange'] = df['high'] - df['low']
+        avg_range = df['hlrange'].mean()
+        volatility_factor = min(max(avg_range / df['close'].iloc[-1], 0.01), 0.05)
         
         signal = "HOLD"
         reason = ""
@@ -559,17 +564,23 @@ def generate_signals(markets_df):
         
         if vol_surge >= VOL_MULTIPLIER and recent_vol > BASE_VOL * avg_vol:
             recent_change = (df['close'].iloc[-1] - df['open'].iloc[-1]) / df['open'].iloc[-1]
+              # Check if recent volume is consistently high
+            vol_consistent = all(v > avg_vol * VOL_MULTIPLIER * 0.7 for v in recent_vols)
             
-            if recent_change > 0.01 and funding_rate < -FUNDING_THRESHOLD:
+            # Calculate dynamic TP/SL based on volatility
+            tp_distance = max(volatility_factor * 5, 0.02)  # Min 2% TP
+            sl_distance = max(volatility_factor * 3, 0.015)  # Min 1.5% SL
+            
+            if recent_change > 0.01 and funding_rate < -FUNDING_THRESHOLD and vol_consistent:
                 signal = "LONG"
                 reason = f"Vol surge {vol_surge:.2f}x with bullish price action and favorable funding rate ({funding_rate:.2f} bps)"
-                tp = str(round(df['close'].iloc[-1] * 1.05, 4))
-                sl = str(round(df['close'].iloc[-1] * 0.97, 4))
-            elif recent_change < -0.01 and funding_rate > FUNDING_THRESHOLD:
+                tp = str(round(df['close'].iloc[-1] * (1 + tp_distance), 4))
+                sl = str(round(df['close'].iloc[-1] * (1 - sl_distance), 4))
+            elif recent_change < -0.01 and funding_rate > FUNDING_THRESHOLD and vol_consistent:
                 signal = "SHORT"
                 reason = f"Vol surge {vol_surge:.2f}x with bearish price action and favorable funding rate ({funding_rate:.2f} bps)"
-                tp = str(round(df['close'].iloc[-1] * 0.95, 4))
-                sl = str(round(df['close'].iloc[-1] * 1.03, 4))
+                tp = str(round(df['close'].iloc[-1] * (1 - tp_distance), 4))
+                sl = str(round(df['close'].iloc[-1] * (1 + sl_distance), 4))
         
         signals.append(Signal(
             Symbol=symbol,
