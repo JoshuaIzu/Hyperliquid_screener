@@ -956,6 +956,7 @@ with tab6:
         value=st.session_state.get('debug_mode', False),
         key="debug_tab_toggle",
         on_change=lambda: st.session_state.update(debug_mode=not st.session_state.debug_mode)
+    )
     
     if debug_enabled != st.session_state.get('debug_mode_prev', None):
         st.session_state.debug_mode_prev = debug_enabled
