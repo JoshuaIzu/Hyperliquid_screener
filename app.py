@@ -213,13 +213,13 @@ def fetch_all_markets():
         debug_info['total_markets'] = len(meta.universe)
         
         all_prices = api_request_with_retry(info.all_mids)
-        
-        market_data = []
+          market_data = []
         skipped_markets = []
         
         progress = st.progress(0)
         status = st.empty()
-          for i, coin in enumerate(meta.universe):
+        
+        for i, coin in enumerate(meta.universe):
             symbol = coin['name']  # Access name using dictionary syntax
             
             try:
