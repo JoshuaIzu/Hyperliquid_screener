@@ -213,7 +213,7 @@ def fetch_all_markets():
         debug_info['total_markets'] = len(meta.universe)
         
         all_prices = api_request_with_retry(info.all_mids)
-          market_data = []
+        market_data = []
         skipped_markets = []
         
         progress = st.progress(0)
@@ -540,7 +540,7 @@ def generate_signals(markets_df):
     for i, (index, market) in enumerate(top_markets.iterrows()):
         symbol = market['symbol']
         status_text.text(f"Analyzing {symbol}... ({i+1}/{total_markets})")
-          df = fetch_hyperliquid_candles(symbol, interval='1h', limit=48)
+        df = fetch_hyperliquid_candles(symbol, interval='1h', limit=48)
         if df is None or len(df) < 6:
             continue
             
