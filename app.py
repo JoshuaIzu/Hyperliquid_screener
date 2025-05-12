@@ -33,7 +33,7 @@ class MarketLevel(BaseModel):
 class OrderBook(BaseModel):
     levels: List[MarketLevel]
     
-    @validator('levels')
+    @validator('levels', allow_reuse=True)
     def validate_levels(cls, v):
         if not v:
             raise ValueError("Order book levels cannot be empty")
