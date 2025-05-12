@@ -41,12 +41,12 @@ class OrderBook(BaseModel):
 
 class MarketMeta(BaseModel):
     name: str
-    szDecimals: int
-    pxDecimals: int
-    minSize: float
+    szDecimals: Optional[int] = None
+    pxDecimals: Optional[int] = None
+    minSize: Optional[float] = None
 
 class MarketUniverse(BaseModel):
-    universe: List[MarketMeta]
+    universe: List[Dict[str, Any]]  # Changed to accept any dictionary structure
 
 class CandleData(BaseModel):
     timestamp: int
