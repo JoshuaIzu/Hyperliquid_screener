@@ -36,6 +36,22 @@ st.set_page_config(
 st.title("📈 Hyperliquid Futures Market Screener")
 st.markdown("Track and analyze cryptocurrency futures markets on Hyperliquid")
 
+# Initialize session state
+def init_session_state():
+    if 'signals' not in st.session_state:
+        st.session_state.signals = []
+    if 'scanned_markets' not in st.session_state:
+        st.session_state.scanned_markets = pd.DataFrame()
+    if 'debug_info' not in st.session_state:
+        st.session_state.debug_info = {}
+    if 'batch_results' not in st.session_state:
+        st.session_state.batch_results = []
+    if 'MIN_LIQUIDITY' not in st.session_state:
+        st.session_state.MIN_LIQUIDITY = 1000
+
+# Call initialization at the start of the script
+init_session_state()
+
 # ======================== PYDANTIC MODELS ========================
 class MarketLevel(BaseModel):
     side: str  # 'b' for bid, 'a' for ask
@@ -114,9 +130,7 @@ class Trade(BaseModel):
 
 # ======================== CONFIGURATION ========================
 BASE_VOL = 0.35
-MIN_LIQUIDITY = 1000
-if 'MIN_LIQUIDITY' not in st.session_state:
-    st.session_state.MIN_LIQUIDITY = MIN_LIQUIDITY
+MIN_LIQUIDITY = st.session_state.MIN_LIQUIDITY
 FUNDING_THRESHOLD = 60
 BATCH_SIZE = 50  # Process ~50 coins per batch (195 / 4 ≈ 49)
 
@@ -126,16 +140,6 @@ def init_hyperliquid():
     return Info(skip_ws=True)
 
 info = init_hyperliquid()
-
-# Initialize session state
-if 'signals' not in st.session_state:
-    st.session_state.signals = []
-if 'scanned_markets' not in st.session_state:
-    st.session_state.scanned_markets = pd.DataFrame()
-if 'debug_info' not in st.session_state:
-    st.session_state.debug_info = {}
-if 'batch_results' not in st.session_state:
-    st.session_state.batch_results = []
 
 # ======================== UTILITY CLASSES ========================
 class RateLimiter:
@@ -258,18 +262,24 @@ def estimate_volume_from_orderbook(symbol):
     try:
         book_response = api_request_with_retry(info.l2_snapshot, symbol)
         if not book_response or 'levels' not in book_response:
-            st.session_state.debug_info[f'volume_empty_{symbol}'] = 'Empty or invalid order book'
+            debug_info = getattr(st.session_state, 'debug_info', {})
+            debug_info[f'volume_empty_{symbol}'] = 'Empty or invalid order book'
+            st.session_state.debug_info = debug_info
             return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
         raw_levels = book_response['levels']
         parsed_levels = parse_orderbook_levels(raw_levels)
         book = OrderBook(levels=parsed_levels)
         if len(book.levels) < 2:
-            st.session_state.debug_info[f'volume_sparse_{symbol}'] = 'Insufficient order book levels'
+            debug_info = getattr(st.session_state, 'debug_info', {})
+            debug_info[f'volume_sparse_{symbol}'] = 'Insufficient order book levels'
+            st.session_state.debug_info = debug_info
             return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
         bids = [level for level in book.levels if level.side == 'b']
         asks = [level for level in book.levels if level.side == 'a']
         if not bids or not asks:
-            st.session_state.debug_info[f'volume_no_bids_asks_{symbol}'] = 'No bids or asks in order book'
+            debug_info = getattr(st.session_state, 'debug_info', {})
+            debug_info[f'volume_no_bids_asks_{symbol}'] = 'No bids or asks in order book'
+            st.session_state.debug_info = debug_info
             return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
         top_bids = sorted(bids, key=lambda x: -x.price)[:5]
         top_asks = sorted(asks, key=lambda x: x.price)[:5]
@@ -278,7 +288,9 @@ def estimate_volume_from_orderbook(symbol):
         bid_price = top_bids[0].price if top_bids else 0
         ask_price = top_asks[0].price if top_asks else 0
         if bid_price <= 0 or ask_price <= 0 or bid_liquidity <= 0 or ask_liquidity <= 0:
-            st.session_state.debug_info[f'volume_invalid_{symbol}'] = 'Invalid prices or liquidity'
+            debug_info = getattr(st.session_state, 'debug_info', {})
+            debug_info[f'volume_invalid_{symbol}'] = 'Invalid prices or liquidity'
+            st.session_state.debug_info = debug_info
             return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
         if bid_price > ask_price:
             bid_price, ask_price = ask_price, bid_price
@@ -289,7 +301,9 @@ def estimate_volume_from_orderbook(symbol):
         volume = total_liquidity_value
         return max(volume, 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000)
     except Exception as e:
-        st.session_state.debug_info[f'volume_error_{symbol}'] = str(e)
+        debug_info = getattr(st.session_state, 'debug_info', {})
+        debug_info[f'volume_error_{symbol}'] = str(e)
+        st.session_state.debug_info = debug_info
         logging.error(f"Volume estimation failed for {symbol}: {str(e)}")
         return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
 
@@ -298,17 +312,23 @@ def validate_api_responses():
     try:
         meta_response = api_request_with_retry(info.meta)
         if not meta_response or 'universe' not in meta_response:
-            st.session_state.debug_info['meta_error'] = 'Invalid or empty meta response'
+            debug_info = getattr(st.session_state, 'debug_info', {})
+            debug_info['meta_error'] = 'Invalid or empty meta response'
+            st.session_state.debug_info = debug_info
             logging.error("Failed to fetch market metadata")
             return False
         all_prices = api_request_with_retry(info.all_mids)
         if not all_prices or not isinstance(all_prices, dict):
-            st.session_state.debug_info['mids_error'] = 'Invalid or empty mids response'
+            debug_info = getattr(st.session_state, 'debug_info', {})
+            debug_info['mids_error'] = 'Invalid or empty mids response'
+            st.session_state.debug_info = debug_info
             logging.error("Failed to fetch mid prices")
             return False
         return True
     except Exception as e:
-        st.session_state.debug_info['api_validation_error'] = str(e)
+        debug_info = getattr(st.session_state, 'debug_info', {})
+        debug_info['api_validation_error'] = str(e)
+        st.session_state.debug_info = debug_info
         logging.error(f"API validation failed: {str(e)}")
         return False
 
@@ -325,6 +345,8 @@ def apply_fallback_for_major_coins():
 # ======================== FETCH ALL MARKETS ========================
 async def fetch_all_markets():
     try:
+        # Ensure session state is initialized
+        init_session_state()
         logging.info("Starting async market fetch")
         debug_info = st.session_state.debug_info
 
@@ -369,6 +391,7 @@ async def fetch_all_markets():
             async def process_coin(coin, idx_in_batch):
                 symbol = coin['name']
                 perp_symbol = f"{symbol}/USDC:USDC"
+                debug_info = getattr(st.session_state, 'debug_info', {})
                 try:
                     # Fetch mid price
                     price = safe_float(all_prices.get(symbol))
@@ -379,6 +402,7 @@ async def fetch_all_markets():
                             'min_required': MIN_LIQUIDITY
                         })
                         debug_info[f'skip_no_price_{symbol}'] = 'Missing price'
+                        st.session_state.debug_info = debug_info
                         return None
 
                     # Estimate volume
@@ -394,6 +418,7 @@ async def fetch_all_markets():
                                 'min_required': MIN_LIQUIDITY
                             })
                             debug_info[f'skip_low_volume_{symbol}'] = f'Volume {volume_24h} < {MIN_LIQUIDITY}'
+                            st.session_state.debug_info = debug_info
                             return None
 
                     # Fetch funding rate
@@ -429,6 +454,7 @@ async def fetch_all_markets():
                         debug_info[f'candles_error_{symbol}'] = str(e)
                         logging.error(f"Candles fetch failed for {symbol}: {str(e)}")
 
+                    st.session_state.debug_info = debug_info
                     return MarketInfo(
                         name=symbol,
                         markPrice=price,
@@ -439,6 +465,7 @@ async def fetch_all_markets():
                     )
                 except Exception as e:
                     debug_info[f'error_{symbol}'] = str(e)
+                    st.session_state.debug_info = debug_info
                     logging.error(f"Processing failed for {symbol}: {str(e)}")
                     return None
 
@@ -500,6 +527,7 @@ async def fetch_all_markets():
         return df.sort_values('volume24h', ascending=False) if not df.empty else pd.DataFrame()
 
     except Exception as e:
+        debug_info = getattr(st.session_state, 'debug_info', {})
         debug_info['critical_error'] = str(e)
         st.session_state.debug_info = debug_info
         st.error(f"Critical error fetching markets: {str(e)}")
@@ -508,6 +536,7 @@ async def fetch_all_markets():
 
 # ======================== DATA FETCHING ========================
 async def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
+    debug_info = getattr(st.session_state, 'debug_info', {})
     try:
         timeframe_map = {'1h': '1h', '4h': '4h', '1d': '1d'}
         timeframe = timeframe_map.get(interval, '1h')
@@ -520,15 +549,18 @@ async def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
             start_time = end_time - (limit * 24 * 60 * 60 * 1000)
         ohlcv = await async_api_request(info.candles_snapshot, symbol, timeframe, start_time, end_time)
         if not ohlcv or len(ohlcv) == 0:
-            st.session_state.debug_info[f'candles_empty_{symbol}'] = 'No candle data returned'
+            debug_info[f'candles_empty_{symbol}'] = 'No candle data returned'
             logging.warning(f"No candle data for {symbol}")
+            st.session_state.debug_info = debug_info
             return None
         parsed_ohlcv = parse_candles(ohlcv)
         df = pd.DataFrame(parsed_ohlcv, columns=['timestamp', 'time_close', 'symbol', 'interval', 'open', 'close', 'high', 'low', 'volume', 'num'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        st.session_state.debug_info = debug_info
         return df
     except Exception as e:
-        st.session_state.debug_info[f'candles_error_{symbol}'] = str(e)
+        debug_info[f'candles_error_{symbol}'] = str(e)
+        st.session_state.debug_info = debug_info
         st.error(f"Error fetching candles for {symbol}: {str(e)}")
         logging.error(f"Error fetching candles for {symbol}: {str(e)}")
         return None
@@ -709,9 +741,11 @@ class ForwardTester:
 
 # ======================== SIGNAL GENERATION ========================
 async def generate_signals(markets_df):
+    debug_info = getattr(st.session_state, 'debug_info', {})
     if markets_df is None or markets_df.empty:
         st.warning("No market data available for signal generation")
-        st.session_state.debug_info['signals_error'] = 'Empty markets DataFrame'
+        debug_info['signals_error'] = 'Empty markets DataFrame'
+        st.session_state.debug_info = debug_info
         logging.warning("No market data for signal generation")
         return []
     
@@ -727,6 +761,7 @@ async def generate_signals(markets_df):
         symbol = market['symbol']
         perp_symbol = f"{symbol}/USDC:USDC"
         status_text.text(f"Analyzing {symbol}... ({index + 1}/{total_markets})")
+        debug_info = getattr(st.session_state, 'debug_info', {})
         try:
             book_response = await async_api_request(info.l2_snapshot, perp_symbol)
             if not book_response or 'levels' not in book_response:
@@ -747,7 +782,8 @@ async def generate_signals(markets_df):
             spread_bps = (spread / mid_price) * 10000
             df = await fetch_hyperliquid_candles(perp_symbol, interval='1h', limit=48)
             if df is None or len(df) < 6:
-                st.session_state.debug_info[f'no_candles_{symbol}'] = 'Insufficient candle data'
+                debug_info[f'no_candles_{symbol}'] = 'Insufficient candle data'
+                st.session_state.debug_info = debug_info
                 logging.warning(f"Insufficient candle data for {symbol}")
                 return None
             recent_vols = df['volume'].tail(3)
@@ -794,6 +830,8 @@ async def generate_signals(markets_df):
                 SL=sl
             )
         except Exception as e:
+            debug_info[f'error_{symbol}'] = str(e)
+            st.session_state.debug_info = debug_info
             logging.error(f"Error analyzing {symbol}: {str(e)}")
             return None
 
@@ -805,12 +843,14 @@ async def generate_signals(markets_df):
 
     progress_bar.progress(1.0)
     status_text.empty()
-    st.session_state.debug_info['signals_generated'] = len(signals)
+    debug_info['signals_generated'] = len(signals)
+    st.session_state.debug_info = debug_info
     logging.info(f"Generated {len(signals)} signals")
     return signals
 
 # ======================== SCAN MARKETS ========================
 def scan_markets():
+    init_session_state()  # Ensure session state is initialized
     st.session_state.scanned_markets = pd.DataFrame()
     st.session_state.signals = []
     
@@ -829,6 +869,9 @@ def scan_markets():
             st.session_state.scanned_markets = markets_df
             st.success(f"Found {len(markets_df)} markets meeting the minimum liquidity threshold of ${MIN_LIQUIDITY:,} USD.")
     except Exception as e:
+        debug_info = getattr(st.session_state, 'debug_info', {})
+        debug_info['scan_error'] = str(e)
+        st.session_state.debug_info = debug_info
         st.error(f"Error during market scan: {str(e)}")
         logging.error(f"Market scan error: {str(e)}")
         return
@@ -845,6 +888,9 @@ def scan_markets():
                 else:
                     st.info("Analysis complete. No actionable signals found with current parameters.")
     except Exception as e:
+        debug_info = getattr(st.session_state, 'debug_info', {})
+        debug_info['signal_gen_error'] = str(e)
+        st.session_state.debug_info = debug_info
         st.error(f"Error during signal generation: {str(e)}")
         logging.error(f"Signal generation error: {str(e)}")
         return
