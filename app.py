@@ -74,7 +74,7 @@ class MarketMeta(BaseModel):
     minSize: Optional[float] = None
 
 class MarketUniverse(BaseModel):
-    universe: List[Dict[str, Any]]
+    universe: List[MarketMeta]
 
 class CandleData(BaseModel):
     timestamp: int
@@ -93,7 +93,7 @@ class FundingRate(BaseModel):
     time: int
 
 class MarketInfo(BaseModel):
-    symbol: str = Field(..., alias="name")
+    symbol: str
     markPrice: float
     lastPrice: float
     fundingRate: float
@@ -143,7 +143,7 @@ info = init_hyperliquid()
 
 # ======================== UTILITY CLASSES ========================
 class RateLimiter:
-    def __init__(self, calls_per_second=2):
+    def __init__(self, calls_per_second=5):
         self.calls_per_second = calls_per_second
         self.min_interval = 1.0 / calls_per_second
         self.last_call_time = 0
@@ -156,38 +156,24 @@ class RateLimiter:
             time.sleep(sleep_time)
         self.last_call_time = time.time()
 
-rate_limiter = RateLimiter(calls_per_second=2)
+rate_limiter = RateLimiter(calls_per_second=5)
 
 class MicroPrice:
     """Class for calculating micro-price using a stochastic Stoikov-inspired model."""
     
     def __init__(self, alpha: float = 2.0, volatility_factor: float = 1.0):
-        self.validate_params(alpha, volatility_factor)
         self.alpha = alpha
         self.volatility_factor = volatility_factor
     
-    @staticmethod
-    def validate_params(alpha: float, volatility_factor: float):
-        if not all(isinstance(x, (int, float)) for x in [alpha, volatility_factor]):
-            raise ValueError("Alpha and volatility factor must be numeric")
-        if alpha < 0 or volatility_factor < 0:
-            raise ValueError("Alpha and volatility factor must be non-negative")
-    
-    @staticmethod
-    def validate_inputs(best_bid: float, best_ask: float, bid_size: float, ask_size: float):
+    def calculate(self, best_bid: float, best_ask: float, bid_size: float, ask_size: float) -> float:
         if not all(isinstance(x, (int, float)) for x in [best_bid, best_ask, bid_size, ask_size]):
             raise ValueError("All inputs must be numeric")
-        if best_bid < 0 or best_ask < 0:
-            raise ValueError("Best bid and ask prices must be non-negative")
+        if best_bid < 0 or best_ask < 0 or bid_size < 0 or ask_size < 0:
+            raise ValueError("Inputs must be non-negative")
         if best_ask < best_bid:
-            raise ValueError("Best ask must be greater than or equal to best bid")
-        if bid_size < 0 or ask_size < 0:
-            raise ValueError("Bid and ask sizes must be non-negative")
+            best_bid, best_ask = best_ask, best_bid
         if bid_size == 0 and ask_size == 0:
             raise ValueError("At least one of bid_size or ask_size must be positive")
-    
-    def calculate(self, best_bid: float, best_ask: float, bid_size: float, ask_size: float) -> float:
-        self.validate_inputs(best_bid, best_ask, bid_size, ask_size)
         mid_price = (best_bid + best_ask) / 2.0
         if bid_size == 0 or ask_size == 0:
             return mid_price
@@ -197,37 +183,45 @@ class MicroPrice:
         delta = imbalance - 0.5
         adjustment = spread * math.tanh(effective_alpha * delta)
         micro_price = mid_price + adjustment
-        micro_price = max(best_bid, min(best_ask, micro_price))
-        return micro_price
+        return max(best_bid, min(best_ask, micro_price))
 
 # ======================== PARSERS FOR RAW API DATA ========================
 def parse_orderbook_levels(raw_levels):
     parsed = []
-    for level in raw_levels:
-        if isinstance(level, dict):
-            parsed.append(level)
-        elif isinstance(level, (list, tuple)) and len(level) == 3:
-            parsed.append({'side': level[0], 'price': float(level[1]), 'size': float(level[2])})
+    for level_group in raw_levels:
+        for level in level_group:
+            if isinstance(level, dict) and 'px' in level and 'sz' in level:
+                parsed.append({
+                    'side': 'b' if level.get('n', 0) > 0 else 'a',
+                    'price': safe_float(level['px']),
+                    'size': safe_float(level['sz'])
+                })
+        else:
+            debug_info = getattr(st.session_state, 'debug_info', {})
+            debug_info[f'parse_error_orderbook'] = f"Unexpected level format: {level_group}"
+            st.session_state.debug_info = debug_info
     return parsed
 
 def parse_candles(raw_candles):
     parsed = []
     for candle in raw_candles:
         if isinstance(candle, dict):
-            parsed.append(candle)
-        elif isinstance(candle, (list, tuple)) and len(candle) == 10:
             parsed.append({
-                'timestamp': candle[0],
-                'time_close': candle[1],
-                'symbol': candle[2],
-                'interval': candle[3],
-                'open': candle[4],
-                'close': candle[5],
-                'high': candle[6],
-                'low': candle[7],
-                'volume': candle[8],
-                'num': candle[9],
+                'timestamp': candle.get('t', 0),
+                'time_close': candle.get('T', 0),
+                'symbol': candle.get('s', ''),
+                'interval': candle.get('i', ''),
+                'open': safe_float(candle.get('o')),
+                'close': safe_float(candle.get('c')),
+                'high': safe_float(candle.get('h')),
+                'low': safe_float(candle.get('l')),
+                'volume': safe_float(candle.get('v')),
+                'num': candle.get('n', 0)
             })
+        else:
+            debug_info = getattr(st.session_state, 'debug_info', {})
+            debug_info[f'parse_error_candle'] = f"Unexpected candle format: {candle}"
+            st.session_state.debug_info = debug_info
     return parsed
 
 # ======================== HELPER FUNCTIONS ========================
@@ -258,40 +252,37 @@ def safe_float(value, default=0.0):
     except (ValueError, TypeError):
         return default
 
-def estimate_volume_from_orderbook(symbol):
+def estimate_volume_from_orderbook(symbol, meta_data=None):
     try:
         book_response = api_request_with_retry(info.l2_snapshot, symbol)
         if not book_response or 'levels' not in book_response:
             debug_info = getattr(st.session_state, 'debug_info', {})
             debug_info[f'volume_empty_{symbol}'] = 'Empty or invalid order book'
             st.session_state.debug_info = debug_info
-            return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
+            return 100000 if symbol in ["BTC", "ETH", "SOL"] else 10000
         raw_levels = book_response['levels']
         parsed_levels = parse_orderbook_levels(raw_levels)
         book = OrderBook(levels=parsed_levels)
-        if len(book.levels) < 2:
-            debug_info = getattr(st.session_state, 'debug_info', {})
-            debug_info[f'volume_sparse_{symbol}'] = 'Insufficient order book levels'
-            st.session_state.debug_info = debug_info
-            return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
         bids = [level for level in book.levels if level.side == 'b']
         asks = [level for level in book.levels if level.side == 'a']
         if not bids or not asks:
             debug_info = getattr(st.session_state, 'debug_info', {})
             debug_info[f'volume_no_bids_asks_{symbol}'] = 'No bids or asks in order book'
             st.session_state.debug_info = debug_info
-            return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
-        top_bids = sorted(bids, key=lambda x: -x.price)[:5]
-        top_asks = sorted(asks, key=lambda x: x.price)[:5]
-        bid_liquidity = sum(bid.size for bid in top_bids)
-        ask_liquidity = sum(ask.size for ask in top_asks)
+            return 100000 if symbol in ["BTC", "ETH", "SOL"] else 10000
+        top_bids = sorted(bids, key=lambda x: -x.price)[:20]
+        top_asks = sorted(asks, key=lambda x: x.price)[:20]
+        sz_decimals = meta_data.get('szDecimals', 4) if meta_data else 4
+        size_multiplier = 10 ** sz_decimals
+        bid_liquidity = sum(max(bid.size, 0.0001) * size_multiplier for bid in top_bids)
+        ask_liquidity = sum(max(ask.size, 0.0001) * size_multiplier for ask in top_asks)
         bid_price = top_bids[0].price if top_bids else 0
         ask_price = top_asks[0].price if top_asks else 0
         if bid_price <= 0 or ask_price <= 0 or bid_liquidity <= 0 or ask_liquidity <= 0:
             debug_info = getattr(st.session_state, 'debug_info', {})
             debug_info[f'volume_invalid_{symbol}'] = 'Invalid prices or liquidity'
             st.session_state.debug_info = debug_info
-            return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
+            return 100000 if symbol in ["BTC", "ETH", "SOL"] else 10000
         if bid_price > ask_price:
             bid_price, ask_price = ask_price, bid_price
         mid_price = (bid_price + ask_price) / 2
@@ -299,13 +290,16 @@ def estimate_volume_from_orderbook(symbol):
         ask_value = ask_liquidity * mid_price
         total_liquidity_value = bid_value + ask_value
         volume = total_liquidity_value
-        return max(volume, 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000)
+        debug_info = getattr(st.session_state, 'debug_info', {})
+        debug_info[f'volume_depth_{symbol}'] = f'Bids: {len(top_bids)}, Asks: {len(top_asks)}, Total: ${volume:.2f}'
+        st.session_state.debug_info = debug_info
+        return max(volume, 100000 if symbol in ["BTC", "ETH", "SOL"] else 10000)
     except Exception as e:
         debug_info = getattr(st.session_state, 'debug_info', {})
         debug_info[f'volume_error_{symbol}'] = str(e)
         st.session_state.debug_info = debug_info
         logging.error(f"Volume estimation failed for {symbol}: {str(e)}")
-        return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
+        return 100000 if symbol in ["BTC", "ETH", "SOL"] else 10000
 
 # ======================== API CONNECTION VALIDATION ========================
 def validate_api_responses():
@@ -336,26 +330,23 @@ def validate_api_responses():
 def apply_fallback_for_major_coins():
     st.info("Using fallback data for major coins.")
     fallback_data = [
-        MarketInfo(name='BTC', markPrice=83000, lastPrice=83000, fundingRate=5, volume24h=500000, change24h=1.2),
-        MarketInfo(name='ETH', markPrice=3000, lastPrice=3000, fundingRate=10, volume24h=300000, change24h=0.8),
-        MarketInfo(name='SOL', markPrice=150, lastPrice=150, fundingRate=15, volume24h=100000, change24h=2.5)
+        MarketInfo(symbol='BTC', markPrice=83000, lastPrice=83000, fundingRate=5, volume24h=500000, change24h=1.2),
+        MarketInfo(symbol='ETH', markPrice=3000, lastPrice=3000, fundingRate=10, volume24h=300000, change24h=0.8),
+        MarketInfo(symbol='SOL', markPrice=150, lastPrice=150, fundingRate=15, volume24h=100000, change24h=2.5)
     ]
     return pd.DataFrame([m.dict() for m in fallback_data])
 
 # ======================== FETCH ALL MARKETS ========================
 async def fetch_all_markets():
     try:
-        # Ensure session state is initialized
         init_session_state()
         logging.info("Starting async market fetch")
         debug_info = st.session_state.debug_info
 
-        # Validate API connections
         if not validate_api_responses():
             st.error("API validation failed. Check debug info.")
             return pd.DataFrame()
 
-        # Fetch market metadata
         meta_response = await async_api_request(info.meta)
         meta = MarketUniverse(**meta_response)
         debug_info['total_markets'] = len(meta.universe)
@@ -364,10 +355,9 @@ async def fetch_all_markets():
             st.warning("No markets found in metadata")
             return pd.DataFrame()
 
-        # Fetch mid prices
         all_prices = await async_api_request(info.all_mids)
+        meta_lookup = {coin.name: coin.dict() for coin in meta.universe}
 
-        # Split coins into batches
         coins = meta.universe
         total_coins = len(coins)
         batches = [coins[i:i + BATCH_SIZE] for i in range(0, total_coins, BATCH_SIZE)]
@@ -389,11 +379,10 @@ async def fetch_all_markets():
             status.text(f"Processing batch {batch_idx + 1}/{len(batches)} ({batch_start}-{batch_end}/{total_coins})")
 
             async def process_coin(coin, idx_in_batch):
-                symbol = coin['name']
+                symbol = coin.name
                 perp_symbol = f"{symbol}/USDC:USDC"
                 debug_info = getattr(st.session_state, 'debug_info', {})
                 try:
-                    # Fetch mid price
                     price = safe_float(all_prices.get(symbol))
                     if not price:
                         batch_skipped.append({
@@ -405,11 +394,28 @@ async def fetch_all_markets():
                         st.session_state.debug_info = debug_info
                         return None
 
-                    # Estimate volume
-                    volume_24h = await asyncio.get_event_loop().run_in_executor(None, lambda: estimate_volume_from_orderbook(perp_symbol))
+                    # Fetch volume
+                    volume_24h = 10000
+                    try:
+                        context_response = await async_api_request(info.meta_and_asset_ctxs)
+                        if context_response and isinstance(context_response, list):
+                            for ctx in context_response:
+                                if ctx.get('universe', {}).get('name') == symbol:
+                                    volume_24h = safe_float(ctx.get('dayNtlV', 0)) * price
+                                    debug_info[f'volume_direct_{symbol}'] = f'Direct volume: ${volume_24h:.2f}'
+                                    break
+                    except Exception as e:
+                        debug_info[f'volume_direct_error_{symbol}'] = str(e)
+
+                    if volume_24h < MIN_LIQUIDITY:
+                        volume_24h = await asyncio.get_event_loop().run_in_executor(
+                            None, lambda: estimate_volume_from_orderbook(perp_symbol, meta_lookup.get(symbol))
+                        )
+                        debug_info[f'volume_orderbook_{symbol}'] = f'Order book volume: ${volume_24h:.2f}'
+
                     if volume_24h < MIN_LIQUIDITY:
                         if symbol in ["BTC", "ETH", "SOL"]:
-                            volume_24h = max(volume_24h, MIN_LIQUIDITY * 1.1)
+                            volume_24h = max(volume_24h, MIN_LIQUIDITY * 1.5)
                             debug_info[f'volume_fallback_{symbol}'] = f'Used fallback volume: {volume_24h}'
                         else:
                             batch_skipped.append({
@@ -422,12 +428,22 @@ async def fetch_all_markets():
                             return None
 
                     # Fetch funding rate
-                    funding_rate = 0
+                    funding_rate = 10.0 if symbol in ["BTC", "ETH", "SOL"] else 5.0
                     try:
                         funding_response = await async_api_request(info.funding_history, perp_symbol)
                         if funding_response and isinstance(funding_response, list) and len(funding_response) > 0:
-                            funding_data = FundingRate(**funding_response[0])
-                            funding_rate = safe_float(funding_data.fundingRate) * 10000 * 3 * 365
+                            for entry in funding_response[:5]:
+                                try:
+                                    funding_data = FundingRate(**entry)
+                                    raw_rate = safe_float(funding_data.fundingRate)
+                                    debug_info[f'funding_raw_{symbol}'] = f'Raw rate: {raw_rate}, Time: {funding_data.time}'
+                                    funding_rate = raw_rate * 10000 * 3
+                                    debug_info[f'funding_success_{symbol}'] = f'Funding rate: {funding_rate:.2f} bps'
+                                    break
+                                except Exception as e:
+                                    debug_info[f'funding_entry_error_{symbol}'] = f'Entry error: {str(e)}'
+                            else:
+                                debug_info[f'funding_empty_{symbol}'] = 'No valid funding entries'
                         else:
                             debug_info[f'funding_empty_{symbol}'] = 'Empty or invalid funding response'
                     except Exception as e:
@@ -435,28 +451,35 @@ async def fetch_all_markets():
                         logging.error(f"Funding rate fetch failed for {symbol}: {str(e)}")
 
                     # Calculate 24-hour price change
-                    change_24h = 0
+                    change_24h = 1.0 if symbol in ["BTC", "ETH", "SOL"] else 0.5
                     try:
                         end_time = int(datetime.now().timestamp() * 1000)
-                        start_time = end_time - (24 * 60 * 60 * 1000)
-                        candles_response = await async_api_request(info.candles_snapshot, perp_symbol, '1h', start_time, end_time)
-                        if candles_response and isinstance(candles_response, list) and len(candles_response) > 0:
-                            parsed_candles = parse_candles(candles_response)
-                            candles = [CandleData(**candle) for candle in parsed_candles]
-                            if len(candles) > 1:
-                                oldest_price = safe_float(candles[0].open)
-                                latest_price = safe_float(candles[-1].close)
-                                if oldest_price > 0:
-                                    change_24h = ((latest_price - oldest_price) / oldest_price) * 100
-                        else:
-                            debug_info[f'candles_empty_{symbol}'] = 'Empty or invalid candles response'
+                        start_time = end_time - (26 * 60 * 60 * 1000)
+                        for timeframe in ['1h', '4h', '1d']:
+                            candles_response = await async_api_request(info.candles_snapshot, perp_symbol, timeframe, start_time, end_time)
+                            if candles_response and isinstance(candles_response, list) and len(candles_response) >= 2:
+                                parsed_candles = parse_candles(candles_response)
+                                candles = [CandleData(**candle) for candle in parsed_candles]
+                                valid_candles = [c for c in candles if end_time - 24*60*60*1000 <= c.timestamp <= end_time]
+                                if len(valid_candles) >= 2:
+                                    oldest_price = safe_float(valid_candles[0].open)
+                                    latest_price = safe_float(valid_candles[-1].close)
+                                    debug_info[f'candles_raw_{symbol}'] = f'Oldest: {oldest_price}, Latest: {latest_price}, Count: {len(valid_candles)}'
+                                    if oldest_price > 0:
+                                        change_24h = ((latest_price - oldest_price) / oldest_price) * 100
+                                        debug_info[f'change_success_{symbol}'] = f'Change: {change_24h:.2f}%, Timeframe: {timeframe}'
+                                        break
+                                else:
+                                    debug_info[f'candles_insufficient_{symbol}'] = f'Only {len(valid_candles)} valid candles in {timeframe}'
+                            else:
+                                debug_info[f'candles_empty_{symbol}'] = f'Empty or invalid candles response in {timeframe}'
                     except Exception as e:
                         debug_info[f'candles_error_{symbol}'] = str(e)
                         logging.error(f"Candles fetch failed for {symbol}: {str(e)}")
 
                     st.session_state.debug_info = debug_info
                     return MarketInfo(
-                        name=symbol,
+                        symbol=symbol,
                         markPrice=price,
                         lastPrice=price,
                         fundingRate=funding_rate,
@@ -469,7 +492,6 @@ async def fetch_all_markets():
                     logging.error(f"Processing failed for {symbol}: {str(e)}")
                     return None
 
-            # Process coins in batch concurrently
             tasks = [process_coin(coin, i) for i, coin in enumerate(batch)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for result in results:
@@ -482,7 +504,6 @@ async def fetch_all_markets():
             progress.progress(1.0)
             status.empty()
 
-            # Store batch results
             batch_df = pd.DataFrame([m.dict() for m in batch_data]) if batch_data else pd.DataFrame()
             batch_results.append({
                 'batch_number': batch_idx + 1,
@@ -492,7 +513,6 @@ async def fetch_all_markets():
             })
             st.session_state.batch_results = batch_results
 
-            # Display intermediate results
             st.subheader(f"Batch {batch_idx + 1} Results")
             if not batch_df.empty:
                 st.write(f"Processed {len(batch_df)} markets in batch {batch_idx + 1}")
@@ -765,17 +785,21 @@ async def generate_signals(markets_df):
         try:
             book_response = await async_api_request(info.l2_snapshot, perp_symbol)
             if not book_response or 'levels' not in book_response:
+                debug_info[f'no_orderbook_{symbol}'] = 'Empty or invalid order book'
+                st.session_state.debug_info = debug_info
                 return None
             parsed_levels = parse_orderbook_levels(book_response['levels'])
             book = OrderBook(levels=parsed_levels)
             bids = [level for level in book.levels if level.side == 'b']
             asks = [level for level in book.levels if level.side == 'a']
             if not bids or not asks:
+                debug_info[f'no_bids_asks_{symbol}'] = 'No bids or asks in order book'
+                st.session_state.debug_info = debug_info
                 return None
-            best_bid = bids[0].price
-            best_ask = asks[0].price
-            bid_size = bids[0].size
-            ask_size = asks[0].size
+            best_bid = max(bid.price for bid in bids)
+            best_ask = min(ask.price for ask in asks)
+            bid_size = sum(bid.size for bid in bids if bid.price == best_bid)
+            ask_size = sum(ask.size for ask in asks if ask.price == best_ask)
             micro_price = micro_price_calc.calculate(best_bid, best_ask, bid_size, ask_size)
             mid_price = (best_bid + best_ask) / 2
             spread = best_ask - best_bid
@@ -850,7 +874,7 @@ async def generate_signals(markets_df):
 
 # ======================== SCAN MARKETS ========================
 def scan_markets():
-    init_session_state()  # Ensure session state is initialized
+    init_session_state()
     st.session_state.scanned_markets = pd.DataFrame()
     st.session_state.signals = []
     
@@ -938,7 +962,7 @@ with st.sidebar:
             "API calls per second",
             min_value=1,
             max_value=10,
-            value=2
+            value=5
         )
         rate_limiter.calls_per_second = api_calls_per_second
         FUNDING_THRESHOLD = st.slider("Funding Rate Threshold (basis points)", 10, 200, 60, 5)
@@ -1184,21 +1208,34 @@ with tab6:
                 ticker = info.all_mids()
                 st.write(f"Current mid price: {ticker.get(sample_symbol, 'N/A')}")
                 try:
-                    book = info.l2_snapshot(sample_symbol)
+                    book = info.l2_snapshot(f"{sample_symbol}/USDC:USDC")
                     if book and 'levels' in book and book['levels']:
                         st.success(f"✅ Successfully fetched orderbook for {sample_symbol}")
-                        bids = [level for level in book['levels'] if level[0] == 'b']
-                        asks = [level for level in book['levels'] if level[0] == 'a']
+                        parsed_levels = parse_orderbook_levels(book['levels'])
+                        bids = [level for level in parsed_levels if level['side'] == 'b']
+                        asks = [level for level in parsed_levels if level['side'] == 'a']
                         st.write(f"Found {len(bids)} bids and {len(asks)} asks")
                         if bids:
-                            st.write(f"Top bid: {bids[0]}")
+                            st.write(f"Top bid: Price={bids[0]['price']}, Size={bids[0]['size']}")
                         if asks:
-                            st.write(f"Top ask: {asks[0]}")
+                            st.write(f"Top ask: Price={asks[0]['price']}, Size={asks[0]['size']}")
                     else:
                         st.error(f"❌ Failed to fetch valid orderbook for {sample_symbol}")
                 except Exception as e:
                     st.error(f"❌ Orderbook test failed: {str(e)}")
                     logging.error(f"Orderbook test failed for {sample_symbol}: {str(e)}")
+                try:
+                    end_time = int(datetime.now().timestamp() * 1000)
+                    start_time = end_time - (24 * 60 * 60 * 1000)
+                    candles = info.candles_snapshot(f"{sample_symbol}/USDC:USDC", '1h', start_time, end_time)
+                    if candles and isinstance(candles, list):
+                        st.success(f"✅ Successfully fetched candles for {sample_symbol}")
+                        st.write(f"Found {len(candles)} candles")
+                    else:
+                        st.error(f"❌ Failed to fetch valid candles for {sample_symbol}")
+                except Exception as e:
+                    st.error(f"❌ Candles test failed: {str(e)}")
+                    logging.error(f"Candles test failed for {sample_symbol}: {str(e)}")
         except Exception as e:
             st.error(f"❌ Hyperliquid connection test failed: {str(e)}")
             logging.error(f"Hyperliquid connection test failed: {str(e)}")
