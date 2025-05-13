@@ -1249,3 +1249,120 @@ with tab6:
         "Enable Debug Mode",
         value=st.session_state.get('debug_mode', False),
         key="debug_tab_toggle",
+        on_change=lambda: st.session_state.update(debug_mode=not st.session_state.get('debug_mode', False))
+    )
+    if debug_enabled != st.session_state.get('debug_mode_prev', None):
+        st.session_state.debug_mode_prev = debug_enabled
+        st.success(f"Debug mode {'enabled' if debug_enabled else 'disabled'}")
+    if st.button("Test Hyperliquid Connection"):
+        try:
+            meta = info.meta()
+            st.success("✅ Hyperliquid connection established")
+            st.write(f"Total markets: {len(meta['universe'])}")
+            if len(meta['universe']) > 0:
+                sample_symbol = meta['universe'][0]['name']
+                st.write(f"Sample market: {sample_symbol}")
+                ticker = info.all_mids()
+                st.write(f"Current mid price: {ticker.get(sample_symbol, 'N/A')}")
+                try:
+                    book = info.l2_snapshot(f"{sample_symbol}/USDC:USDC")
+                    if book and 'levels' in book and book['levels']:
+                        st.success(f"✅ Successfully fetched orderbook for {sample_symbol}")
+                        parsed_levels = parse_orderbook_levels(book['levels'])
+                        bids = [level for level in parsed_levels if level['side'] == 'b']
+                        asks = [level for level in parsed_levels if level['side'] == 'a']
+                        st.write(f"Found {len(bids)} bids and {len(asks)} asks")
+                        if bids:
+                            st.write(f"Top bid: Price={bids[0]['price']}, Size={bids[0]['size']}")
+                        if asks:
+                            st.write(f"Top ask: Price={asks[0]['price']}, Size={asks[0]['size']}")
+                    else:
+                        st.error(f"❌ Failed to fetch valid orderbook for {sample_symbol}")
+                except Exception as e:
+                    st.error(f"❌ Orderbook test failed: {str(e)}")
+                    logging.error(f"Orderbook test failed for {sample_symbol}: {str(e)}")
+                try:
+                    end_time = int(datetime.now().timestamp() * 1000)
+                    start_time = end_time - (24 * 60 * 60 * 1000)
+                    candles = info.candles_snapshot(f"{sample_symbol}/USDC:USDC", '1h', start_time, end_time)
+                    if candles and isinstance(candles, list):
+                        st.success(f"✅ Successfully fetched candles for {sample_symbol}")
+                        st.write(f"Found {len(candles)} candles")
+                    else:
+                        st.error(f"❌ Failed to fetch valid candles for {sample_symbol}")
+                except Exception as e:
+                    st.error(f"❌ Candles test failed: {str(e)}")
+                    logging.error(f"Candles test failed for {sample_symbol}: {str(e)}")
+                try:
+                    end_time = int(datetime.now().timestamp() * 1000)
+                    start_time = end_time - (24 * 60 * 60 * 1000)
+                    funding = info.funding_history(sample_symbol, start_time)
+                    if funding and isinstance(funding, list):
+                        st.success(f"✅ Successfully fetched funding history for {sample_symbol}")
+                        st.write(f"Found {len(funding)} funding records")
+                    else:
+                        st.error(f"❌ Failed to fetch valid funding history for {sample_symbol}")
+                except Exception as e:
+                    st.error(f"❌ Funding history test failed: {str(e)}")
+                    logging.error(f"Funding history test failed for {sample_symbol}: {str(e)}")
+        except Exception as e:
+            st.error(f"❌ Hyperliquid connection test failed: {str(e)}")
+            logging.error(f"Hyperliquid connection test failed: {str(e)}")
+    
+    if st.session_state.debug_info:
+        st.subheader("Last Scan Debug Info")
+        cols = st.columns(3)
+        with cols[0]:
+            st.metric("Total Markets", st.session_state.debug_info.get('total_markets', 'N/A'))
+        with cols[1]:
+            st.metric("Markets Processed", st.session_state.debug_info.get('markets_processed', 'N/A'))
+        with cols[2]:
+            st.metric("Markets Skipped", st.session_state.debug_info.get('markets_skipped', 'N/A'))
+        
+        if 'skipped_samples' in st.session_state.debug_info and st.session_state.debug_info['skipped_samples']:
+            st.subheader("Sample Skipped Markets")
+            st.json(st.session_state.debug_info['skipped_samples'])
+        
+        errors = {k: v for k, v in st.session_state.debug_info.items() if 'error' in k.lower()}
+        if errors:
+            with st.expander("Error Details"):
+                for k, v in errors.items():
+                    st.error(f"{k}: {v}")
+    
+    st.subheader("Cache Status")
+    if os.path.exists('market_cache.db'):
+        conn = sqlite3.connect('market_cache.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM market_cache")
+        market_cache_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM ohlcv_cache")
+        ohlcv_cache_count = cursor.fetchone()[0]
+        conn.close()
+        st.write(f"Markets in cache: {market_cache_count}")
+        st.write(f"OHLCV data sets in cache: {ohlcv_cache_count}")
+        if st.button("Clear All Cache"):
+            try:
+                conn = sqlite3.connect('market_cache.db')
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM market_cache")
+                cursor.execute("DELETE FROM ohlcv_cache")
+                conn.commit()
+                conn.close()
+                st.cache_data.clear()
+                st.success("✅ Cache cleared successfully")
+                st.info("Please scan markets again to refresh data")
+            except Exception as e:
+                st.error(f"❌ Failed to clear cache: {str(e)}")
+                logging.error(f"Clear cache failed: {str(e)}")
+    else:
+        st.write("Cache database not found.")
+    
+    st.subheader("Rate Limiter Settings")
+    current_rate = st.session_state.get('api_rate', rate_limiter.calls_per_second)
+    rate = st.slider("API calls per second", 1, 10, int(current_rate), 1)
+    if rate != current_rate:
+        rate_limiter.calls_per_second = rate
+        st.session_state.api_rate = rate
+        st.success(f"Rate limiter updated to {rate} calls per second")
+    
+    st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (WAT)")
