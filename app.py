@@ -156,6 +156,103 @@ class RateLimiter:
         self.last_call_time = time.time()
 
 rate_limiter = RateLimiter(calls_per_second=4)
+volume_fetcher = VolumeFetcher(info, rate_limit_calls_per_second=4)
+
+class VolumeFetcher:
+    def __init__(self, info_client: Info, rate_limit_calls_per_second: int = 4):
+        self.info = info_client
+        self.rate_limiter = RateLimiter(calls_per_second=rate_limit_calls_per_second)
+
+    def get_volume_24h(self, symbol: str) -> Optional[float]:
+        """Fetch the 24-hour trading volume for a given symbol using candlestick data, with order book fallback.
+
+        Args:
+            symbol (str): The trading pair (e.g., "BTC" or "BTC/USDC:USDC").
+
+        Returns:
+            Optional[float]: The estimated 24-hour volume in USD, or None if fetching fails.
+        """
+        try:
+            # Prepare timestamps for the last 24 hours
+            end_time = int(datetime.utcnow().timestamp() * 1000)  # Current time in UTC milliseconds
+            start_time = end_time - (24 * 60 * 60 * 1000)  # 24 hours ago in UTC milliseconds
+
+            # Step 1: Try fetching volume from candlestick data
+            candles = self._fetch_candles_snapshot(symbol, "1h", start_time, end_time)
+            if candles and isinstance(candles, list) and len(candles) > 0:
+                total_volume = sum(safe_float(candle.get("v", 0)) for candle in candles)
+                logging.info(f"Volume from candles for {symbol}: ${total_volume:.2f}")
+                return max(total_volume, 10000)  # Minimum fallback volume
+
+            # Step 2: Fallback to order book estimation if candles fail
+            logging.warning(f"Candlestick data unavailable for {symbol}, falling back to order book")
+            return self._estimate_volume_from_orderbook(symbol)
+
+        except Exception as e:
+            logging.error(f"Failed to get volume for {symbol}: {str(e)}")
+            return 10000  # Default fallback volume for major coins or errors
+
+    def _fetch_candles_snapshot(self, name: str, interval: str, start_time: int, end_time: int) -> Any:
+        """Helper method to fetch candlestick data with rate limiting and error handling."""
+        self.rate_limiter.wait()
+        try:
+            req = {
+                "coin": self.info.name_to_coin.get(name, name),  # Handle symbol conversion
+                "interval": interval,
+                "startTime": start_time,
+                "endTime": end_time
+            }
+            response = self.info.post("/info", {"type": "candleSnapshot", "req": req})
+            if response and isinstance(response, list):
+                return response
+            logging.warning(f"Invalid candles response for {name}: {str(response)[:200]}")
+            return None
+        except Exception as e:
+            logging.error(f"Candles snapshot error for {name}: {str(e)}")
+            return None
+
+    def _estimate_volume_from_orderbook(self, symbol: str) -> float:
+        """Estimate volume based on order book liquidity."""
+        self.rate_limiter.wait()
+        try:
+            book_response = self.info.l2_snapshot(symbol)
+            if not book_response or "levels" not in book_response:
+                logging.warning(f"Invalid order book for {symbol}")
+                return 10000
+
+            parsed_levels = self._parse_orderbook_levels(book_response["levels"])
+            bids = [level for level in parsed_levels if level["side"] == "b"]
+            asks = [level for level in parsed_levels if level["side"] == "a"]
+
+            if not bids or not asks:
+                logging.warning(f"No bids or asks in order book for {symbol}")
+                return 10000
+
+            top_bids = sorted(bids, key=lambda x: -x["price"])[:20]
+            top_asks = sorted(asks, key=lambda x: x["price"])[:20]
+            bid_liquidity = sum(level["size"] for level in top_bids)
+            ask_liquidity = sum(level["size"] for level in top_asks)
+            mid_price = (top_bids[0]["price"] + top_asks[0]["price"]) / 2
+
+            estimated_volume = (bid_liquidity + ask_liquidity) * mid_price
+            logging.info(f"Estimated volume from order book for {symbol}: ${estimated_volume:.2f}")
+            return max(estimated_volume, 10000)
+        except Exception as e:
+            logging.error(f"Order book estimation failed for {symbol}: {str(e)}")
+            return 10000
+
+    def _parse_orderbook_levels(self, raw_levels: Any) -> list:
+        """Parse raw order book levels into a standardized format."""
+        parsed = []
+        for level_group in raw_levels:
+            for level in level_group:
+                if isinstance(level, dict) and "px" in level and "sz" in level:
+                    parsed.append({
+                        "side": "b" if level.get("n", 0) > 0 else "a",
+                        "price": safe_float(level["px"]),
+                        "size": safe_float(level["sz"])
+                    })
+        return parsed
 
 class MicroPrice:
     def __init__(self, alpha: float = 2.0, volatility_factor: float = 1.0):
@@ -252,55 +349,6 @@ def safe_float(value, default=0.0):
 def validate_symbol(symbol, meta_universe):
     base_symbol = symbol.split('/')[0] if '/' in symbol else symbol
     return any(coin.name == base_symbol for coin in meta_universe)
-
-def estimate_volume_from_orderbook(symbol, meta_data=None):
-    try:
-        book_response = api_request_with_retry(info.l2_snapshot, symbol)
-        if not book_response or 'levels' not in book_response:
-            debug_info = getattr(st.session_state, 'debug_info', {})
-            debug_info[f'volume_empty_{symbol}'] = 'Empty or invalid order book'
-            st.session_state.debug_info = debug_info
-            return 100000 if symbol in ["BTC", "ETH", "SOL"] else 10000
-        raw_levels = book_response['levels']
-        parsed_levels = parse_orderbook_levels(raw_levels)
-        book = OrderBook(levels=parsed_levels)
-        bids = [level for level in book.levels if level.side == 'b']
-        asks = [level for level in book.levels if level.side == 'a']
-        if not bids or not asks:
-            debug_info = getattr(st.session_state, 'debug_info', {})
-            debug_info[f'volume_no_bids_asks_{symbol}'] = 'No bids or asks in order book'
-            st.session_state.debug_info = debug_info
-            return 100000 if symbol in ["BTC", "ETH", "SOL"] else 10000
-        top_bids = sorted(bids, key=lambda x: -x.price)[:20]
-        top_asks = sorted(asks, key=lambda x: x.price)[:20]
-        sz_decimals = meta_data.get('szDecimals', 4) if meta_data else 4
-        size_multiplier = 10 ** sz_decimals
-        bid_liquidity = sum(max(bid.size, 0.0001) * size_multiplier for bid in top_bids)
-        ask_liquidity = sum(max(ask.size, 0.0001) * size_multiplier for ask in top_asks)
-        bid_price = top_bids[0].price if top_bids else 0
-        ask_price = top_asks[0].price if top_asks else 0
-        if bid_price <= 0 or ask_price <= 0 or bid_liquidity <= 0 or ask_liquidity <= 0:
-            debug_info = getattr(st.session_state, 'debug_info', {})
-            debug_info[f'volume_invalid_{symbol}'] = 'Invalid prices or liquidity'
-            st.session_state.debug_info = debug_info
-            return 100000 if symbol in ["BTC", "ETH", "SOL"] else 10000
-        if bid_price > ask_price:
-            bid_price, ask_price = ask_price, bid_price
-        mid_price = (bid_price + ask_price) / 2
-        bid_value = bid_liquidity * mid_price
-        ask_value = ask_liquidity * mid_price
-        total_liquidity_value = bid_value + ask_value
-        volume = total_liquidity_value
-        debug_info = getattr(st.session_state, 'debug_info', {})
-        debug_info[f'volume_depth_{symbol}'] = f'Bids: {len(top_bids)}, Asks: {len(top_asks)}, Total: ${volume:.2f}'
-        st.session_state.debug_info = debug_info
-        return max(volume, 100000 if symbol in ["BTC", "ETH", "SOL"] else 10000)
-    except Exception as e:
-        debug_info = getattr(st.session_state, 'debug_info', {})
-        debug_info[f'volume_error_{symbol}'] = str(e)
-        st.session_state.debug_info = debug_info
-        logging.error(f"Volume estimation failed for {symbol}: {str(e)}")
-        return 100000 if symbol in ["BTC", "ETH", "SOL"] else 10000
 
 # ======================== API CONNECTION VALIDATION ========================
 def validate_api_responses():
@@ -405,37 +453,11 @@ async def fetch_all_markets():
                         st.session_state.debug_info = debug_info
                         return None
 
-                    # Fetch volume
-                    volume_24h = 10000
-                    try:
-                        context_response = await async_api_request(info.meta_and_asset_ctxs)
-                        debug_info[f'context_response_{symbol}'] = str(context_response)[:500]  # Log first 500 chars of response
-                        if context_response and isinstance(context_response, list):
-                            found = False
-                            for ctx in context_response:
-                                # Ensure ctx is a dictionary before proceeding
-                                if not isinstance(ctx, dict):
-                                    debug_info[f'volume_direct_error_{symbol}'] = f"Unexpected ctx type: {type(ctx)}"
-                                    continue
-                                universe = ctx.get('universe', {})
-                                if not isinstance(universe, dict):
-                                    debug_info[f'volume_direct_error_{symbol}'] = f"Unexpected universe type: {type(universe)}"
-                                    continue
-                                if universe.get('name') == symbol:
-                                    volume_24h = safe_float(ctx.get('dayNtlV', 0)) * price
-                                    debug_info[f'volume_direct_{symbol}'] = f'Direct volume: ${volume_24h:.2f}'
-                                    found = True
-                                    break
-                            if not found:
-                                debug_info[f'volume_direct_not_found_{symbol}'] = f'No matching symbol in context_response'
-                    except Exception as e:
-                        debug_info[f'volume_direct_error_{symbol}'] = str(e)
-
-                    if volume_24h < MIN_LIQUIDITY:
-                        volume_24h = await asyncio.get_event_loop().run_in_executor(
-                            None, lambda: estimate_volume_from_orderbook(perp_symbol, meta_lookup.get(symbol))
-                        )
-                        debug_info[f'volume_orderbook_{symbol}'] = f'Order book volume: ${volume_24h:.2f}'
+                    # Fetch volume using VolumeFetcher
+                    volume_24h = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: volume_fetcher.get_volume_24h(perp_symbol)
+                    )
+                    debug_info[f'volume_fetch_{symbol}'] = f'Volume: ${volume_24h:.2f}'
 
                     if volume_24h < MIN_LIQUIDITY:
                         if symbol in ["BTC", "ETH", "SOL"]:
@@ -1227,120 +1249,3 @@ with tab6:
         "Enable Debug Mode",
         value=st.session_state.get('debug_mode', False),
         key="debug_tab_toggle",
-        on_change=lambda: st.session_state.update(debug_mode=not st.session_state.debug_mode)
-    )
-    if debug_enabled != st.session_state.get('debug_mode_prev', None):
-        st.session_state.debug_mode_prev = debug_enabled
-        st.success(f"Debug mode {'enabled' if debug_enabled else 'disabled'}")
-    if st.button("Test Hyperliquid Connection"):
-        try:
-            meta = info.meta()
-            st.success("✅ Hyperliquid connection established")
-            st.write(f"Total markets: {len(meta['universe'])}")
-            if len(meta['universe']) > 0:
-                sample_symbol = meta['universe'][0]['name']
-                st.write(f"Sample market: {sample_symbol}")
-                ticker = info.all_mids()
-                st.write(f"Current mid price: {ticker.get(sample_symbol, 'N/A')}")
-                try:
-                    book = info.l2_snapshot(f"{sample_symbol}/USDC:USDC")
-                    if book and 'levels' in book and book['levels']:
-                        st.success(f"✅ Successfully fetched orderbook for {sample_symbol}")
-                        parsed_levels = parse_orderbook_levels(book['levels'])
-                        bids = [level for level in parsed_levels if level['side'] == 'b']
-                        asks = [level for level in parsed_levels if level['side'] == 'a']
-                        st.write(f"Found {len(bids)} bids and {len(asks)} asks")
-                        if bids:
-                            st.write(f"Top bid: Price={bids[0]['price']}, Size={bids[0]['size']}")
-                        if asks:
-                            st.write(f"Top ask: Price={asks[0]['price']}, Size={asks[0]['size']}")
-                    else:
-                        st.error(f"❌ Failed to fetch valid orderbook for {sample_symbol}")
-                except Exception as e:
-                    st.error(f"❌ Orderbook test failed: {str(e)}")
-                    logging.error(f"Orderbook test failed for {sample_symbol}: {str(e)}")
-                try:
-                    end_time = int(datetime.now().timestamp() * 1000)
-                    start_time = end_time - (24 * 60 * 60 * 1000)
-                    candles = info.candles_snapshot(f"{sample_symbol}/USDC:USDC", '1h', start_time, end_time)
-                    if candles and isinstance(candles, list):
-                        st.success(f"✅ Successfully fetched candles for {sample_symbol}")
-                        st.write(f"Found {len(candles)} candles")
-                    else:
-                        st.error(f"❌ Failed to fetch valid candles for {sample_symbol}")
-                except Exception as e:
-                    st.error(f"❌ Candles test failed: {str(e)}")
-                    logging.error(f"Candles test failed for {sample_symbol}: {str(e)}")
-                try:
-                    end_time = int(datetime.now().timestamp() * 1000)
-                    start_time = end_time - (24 * 60 * 60 * 1000)
-                    funding = info.funding_history(sample_symbol, start_time)
-                    if funding and isinstance(funding, list):
-                        st.success(f"✅ Successfully fetched funding history for {sample_symbol}")
-                        st.write(f"Found {len(funding)} funding records")
-                    else:
-                        st.error(f"❌ Failed to fetch valid funding history for {sample_symbol}")
-                except Exception as e:
-                    st.error(f"❌ Funding history test failed: {str(e)}")
-                    logging.error(f"Funding history test failed for {sample_symbol}: {str(e)}")
-        except Exception as e:
-            st.error(f"❌ Hyperliquid connection test failed: {str(e)}")
-            logging.error(f"Hyperliquid connection test failed: {str(e)}")
-    
-    if st.session_state.debug_info:
-        st.subheader("Last Scan Debug Info")
-        cols = st.columns(3)
-        with cols[0]:
-            st.metric("Total Markets", st.session_state.debug_info.get('total_markets', 'N/A'))
-        with cols[1]:
-            st.metric("Markets Processed", st.session_state.debug_info.get('markets_processed', 'N/A'))
-        with cols[2]:
-            st.metric("Markets Skipped", st.session_state.debug_info.get('markets_skipped', 'N/A'))
-        
-        if 'skipped_samples' in st.session_state.debug_info and st.session_state.debug_info['skipped_samples']:
-            st.subheader("Sample Skipped Markets")
-            st.json(st.session_state.debug_info['skipped_samples'])
-        
-        errors = {k: v for k, v in st.session_state.debug_info.items() if 'error' in k.lower()}
-        if errors:
-            with st.expander("Error Details"):
-                for k, v in errors.items():
-                    st.error(f"{k}: {v}")
-    
-    st.subheader("Cache Status")
-    if os.path.exists('market_cache.db'):
-        conn = sqlite3.connect('market_cache.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM market_cache")
-        market_cache_count = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM ohlcv_cache")
-        ohlcv_cache_count = cursor.fetchone()[0]
-        conn.close()
-        st.write(f"Markets in cache: {market_cache_count}")
-        st.write(f"OHLCV data sets in cache: {ohlcv_cache_count}")
-        if st.button("Clear All Cache"):
-            try:
-                conn = sqlite3.connect('market_cache.db')
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM market_cache")
-                cursor.execute("DELETE FROM ohlcv_cache")
-                conn.commit()
-                conn.close()
-                st.cache_data.clear()
-                st.success("✅ Cache cleared successfully")
-                st.info("Please scan markets again to refresh data")
-            except Exception as e:
-                st.error(f"❌ Failed to clear cache: {str(e)}")
-                logging.error(f"Clear cache failed: {str(e)}")
-    else:
-        st.write("Cache database not found.")
-    
-    st.subheader("Rate Limiter Settings")
-    current_rate = st.session_state.get('api_rate', rate_limiter.calls_per_second)
-    rate = st.slider("API calls per second", 1, 10, int(current_rate), 1)
-    if rate != current_rate:
-        rate_limiter.calls_per_second = rate
-        st.session_state.api_rate = rate
-        st.success(f"Rate limiter updated to {rate} calls per second")
-    
-    st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
