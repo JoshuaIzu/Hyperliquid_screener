@@ -107,8 +107,7 @@ class Trade(BaseModel):
 
 # ======================== CONFIGURATION ========================
 BASE_VOL = 0.35
-VOL_MULTIPLIER = 1.5
-MIN_LIQUIDITY = 5000  # Lowered default for broader market inclusion
+MIN_LIQUIDITY = 1000  # Lowered to 1,000 for broader market inclusion
 if 'MIN_LIQUIDITY' not in st.session_state:
     st.session_state.MIN_LIQUIDITY = MIN_LIQUIDITY
 FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
@@ -317,8 +316,7 @@ def estimate_volume_from_orderbook(symbol):
         bid_value = bid_liquidity * mid_price
         ask_value = ask_liquidity * mid_price
         total_liquidity_value = bid_value + ask_value
-        volume_multiplier = 20 if symbol in ["BTC", "ETH"] else 10
-        volume = total_liquidity_value * volume_multiplier
+        volume = total_liquidity_value
         return max(volume, 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000)
     except Exception as e:
         st.session_state.debug_info[f'volume_error_{symbol}'] = str(e)
@@ -390,6 +388,7 @@ def fetch_all_markets():
 
         for i, coin in enumerate(meta.universe):
             symbol = coin['name']
+            perp_symbol = f"{symbol}/USDC:USDC"
             try:
                 progress.progress((i + 1) / len(meta.universe))
                 status.text(f"Processing {i+1}/{len(meta.universe)}: {symbol}")
@@ -406,7 +405,7 @@ def fetch_all_markets():
                     continue
 
                 # Estimate volume
-                volume_24h = estimate_volume_from_orderbook(symbol)
+                volume_24h = estimate_volume_from_orderbook(perp_symbol)
                 if volume_24h < MIN_LIQUIDITY:
                     if symbol in ["BTC", "ETH", "SOL"]:
                         volume_24h = max(volume_24h, MIN_LIQUIDITY * 1.1)
@@ -423,7 +422,7 @@ def fetch_all_markets():
                 # Fetch funding rate
                 funding_rate = 0
                 try:
-                    funding_response = api_request_with_retry(info.funding_history, symbol)
+                    funding_response = api_request_with_retry(info.funding_history, perp_symbol)
                     if funding_response and isinstance(funding_response, list) and len(funding_response) > 0:
                         funding_data = FundingRate(**funding_response[0])
                         funding_rate = safe_float(funding_data.fundingRate) * 10000 * 3 * 365
@@ -438,7 +437,7 @@ def fetch_all_markets():
                 try:
                     end_time = int(datetime.now().timestamp() * 1000)
                     start_time = end_time - (24 * 60 * 60 * 1000)
-                    candles_response = api_request_with_retry(info.candles_snapshot, symbol, '1h', start_time, end_time)
+                    candles_response = api_request_with_retry(info.candles_snapshot, perp_symbol, '1h', start_time, end_time)
                     if candles_response and isinstance(candles_response, list) and len(candles_response) > 0:
                         parsed_candles = parse_candles(candles_response)
                         candles = [CandleData(**candle) for candle in parsed_candles]
@@ -762,7 +761,7 @@ def generate_signals(markets_df):
             avg_vol = df['volume'].mean()
             recent_vol = recent_vols.mean()
             vol_surge = recent_vol / avg_vol if avg_vol > 0 else 0
-            vol_consistent = all(v > avg_vol * VOL_MULTIPLIER * 0.7 for v in recent_vols)
+            vol_consistent = all(v > avg_vol * 0.7 for v in recent_vols)
             
             # Volatility calculation for dynamic TP/SL
             df['hlrange'] = df['high'] - df['low']
@@ -789,7 +788,7 @@ def generate_signals(markets_df):
             sl_distance = max(volatility_factor * 3, 0.015)  # Minimum 1.5% SL
             
             # Signal generation combining all factors
-            if spread_bps <= max_spread_bps and vol_surge >= VOL_MULTIPLIER and vol_consistent:
+            if spread_bps <= max_spread_bps and vol_surge >= 1.5 and vol_consistent:
                 if micro_price_deviation > price_threshold and funding_rate < -FUNDING_THRESHOLD:
                     signal = "LONG"
                     reason = f"Micro-price above mid: {micro_price_deviation:.4f}, Vol surge {vol_surge:.2f}x, Funding {funding_rate:.2f} bps"
@@ -872,9 +871,9 @@ tester = ForwardTester()
 with st.sidebar:
     st.header("Parameters")
     BASE_VOL = st.slider("Base Volume Threshold", 0.1, 2.0, 0.35, 0.05)
-    VOL_MULTIPLIER = st.slider("Volume Multiplier", 1.0, 3.0, 1.5, 0.1)
     
     liquidity_options = {
+        "1,000 USD": 1000,
         "5,000 USD": 5000,
         "10,000 USD": 10000,
         "25,000 USD": 25000,
@@ -887,7 +886,7 @@ with st.sidebar:
     selected_liquidity = st.selectbox(
         "Minimum Liquidity",
         options=list(liquidity_options.keys()),
-        index=0  # Default to 5,000 USD
+        index=0  # Default to 1,000 USD
     )
     
     MIN_LIQUIDITY = liquidity_options[selected_liquidity]
@@ -1229,4 +1228,3 @@ with tab6:
         st.success(f"Rate limiter updated to {rate} calls per second")
     
     st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-``` 
