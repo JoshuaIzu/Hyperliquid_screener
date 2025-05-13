@@ -18,6 +18,8 @@ import asyncio
 import aiohttp
 from concurrent.futures import ThreadPoolExecutor
 import nest_asyncio
+import random
+import random
 
 # Apply nest_asyncio to allow nested event loops in Streamlit
 nest_asyncio.apply()
@@ -174,26 +176,45 @@ class VolumeFetcher:
 
         except Exception as e:
             logging.error(f"Failed to get volume for {symbol}: {str(e)}")
-            return 10000  # Default fallback volume for major coins or errors
-
-    def _fetch_candles_snapshot(self, name: str, interval: str, start_time: int, end_time: int) -> Any:
+            return 10000  # Default fallback volume for major coins or errors    def _fetch_candles_snapshot(self, name: str, interval: str, start_time: int, end_time: int) -> Any:
         """Helper method to fetch candlestick data with rate limiting and error handling."""
         self.rate_limiter.wait()
-        try:
-            req = {
-                "coin": self.info.name_to_coin.get(name, name),  # Handle symbol conversion
-                "interval": interval,
-                "startTime": start_time,
-                "endTime": end_time
-            }
-            response = self.info.post("/info", {"type": "candleSnapshot", "req": req})
-            if response and isinstance(response, list):
-                return response
-            logging.warning(f"Invalid candles response for {name}: {str(response)[:200]}")
-            return None
-        except Exception as e:
-            logging.error(f"Candles snapshot error for {name}: {str(e)}")
-            return None
+        
+        # Determine if we need to try different symbol formats
+        is_full_format = '/' in name and ':' in name
+        symbol_formats = []
+        
+        if is_full_format:
+            # Symbol is already in full format like "BTC/USDC:USDC"
+            symbol_formats.append(name)
+            # Extract the base symbol (e.g., "BTC" from "BTC/USDC:USDC")
+            base_symbol = name.split('/')[0]
+            symbol_formats.append(base_symbol)
+        else:
+            # Symbol is in base format like "BTC"
+            symbol_formats.append(name)
+            symbol_formats.append(f"{name}/USDC:USDC")
+            
+        errors = []
+        for sym_format in symbol_formats:
+            try:
+                req = {
+                    "coin": self.info.name_to_coin.get(sym_format, sym_format),
+                    "interval": interval,
+                    "startTime": start_time,
+                    "endTime": end_time
+                }
+                response = self.info.post("/info", {"type": "candleSnapshot", "req": req})
+                if response and isinstance(response, list) and len(response) > 0:
+                    return response
+                else:
+                    errors.append(f"Empty or invalid response for format {sym_format}")
+            except Exception as e:
+                errors.append(f"Error with format {sym_format}: {str(e)}")
+                
+        # If we got here, all formats failed
+        logging.warning(f"Failed to get candles for {name}. Tried formats: {symbol_formats}. Errors: {errors}")
+        return None
 
     def _estimate_volume_from_orderbook(self, symbol: str) -> float:
         """Estimate volume based on order book liquidity."""
@@ -320,17 +341,40 @@ def parse_candles(raw_candles):
     return parsed
 
 # ======================== HELPER FUNCTIONS ========================
-def api_request_with_retry(func, *args, max_retries=3, **kwargs):
+def api_request_with_retry(func, *args, max_retries=None, **kwargs):
+    # Use max_retries from session state if available, otherwise use the provided value or default to 5
+    if max_retries is None:
+        max_retries = st.session_state.get('api_max_retries', 5)
+    
     for attempt in range(max_retries):
         try:
             rate_limiter.wait()
             response = func(*args, **kwargs)
             return response
         except Exception as e:
+            # Check if this is a rate limit error (HTTP 429)
+            is_rate_limit_error = False
+            if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
+                is_rate_limit_error = e.response.status_code == 429
+            elif str(e).find('429') >= 0 or str(e).lower().find('rate limit') >= 0:
+                is_rate_limit_error = True
+            
             if attempt == max_retries - 1:
-                logging.error(f"API request failed after {max_retries} retries: {str(e)}")
+                error_type = "Rate limit exceeded" if is_rate_limit_error else "API request"
+                logging.error(f"{error_type} failed after {max_retries} retries: {str(e)}")
                 raise
-            time.sleep(1 * (2 ** attempt))
+                
+            # Calculate backoff time with exponential increase and jitter
+            # The more attempts we've made, the longer we'll wait
+            # Adding jitter helps prevent all retries happening simultaneously
+            backoff = (2 ** attempt) + random.uniform(0.1, 1.0)
+            
+            # If it's a rate limit error, wait even longer
+            if is_rate_limit_error:
+                backoff *= 2
+                
+            logging.warning(f"API request failed (attempt {attempt+1}/{max_retries}), retrying in {backoff:.2f}s: {str(e)}")
+            time.sleep(backoff)
     return None
 
 async def async_api_request(func, *args, **kwargs):
@@ -615,14 +659,57 @@ async def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
         timeframe_map = {'1h': '1h', '4h': '4h', '1d': '1d'}
         timeframe = timeframe_map.get(interval, '1h')
         end_time = int(datetime.now().timestamp() * 1000)
-        start_time = end_time - (48 * 60 * 60 * 1000)
-        ohlcv = await async_api_request(info.candles_snapshot, symbol, timeframe, start_time, end_time)
-        debug_info[f'candles_response_{symbol}_{timeframe}'] = str(ohlcv)
+        
+        # Calculate start time based on interval and limit
+        if interval == '1h':
+            start_time = end_time - (limit * 60 * 60 * 1000)
+        elif interval == '4h':
+            start_time = end_time - (limit * 4 * 60 * 60 * 1000)
+        else:  # 1d
+            start_time = end_time - (limit * 24 * 60 * 60 * 1000)
+        
+        # Try different symbol formats - first attempt with the symbol as provided
+        ohlcv = None
+        errors = []
+        
+        # Determine if we need to try different symbol formats
+        # If already in full format, strip it down to base; if base format, try full format
+        is_full_format = '/' in symbol and ':' in symbol
+        
+        if is_full_format:
+            # Symbol is already in full format like "BTC/USDC:USDC"
+            # Try first with the provided format
+            symbol_formats = [symbol]
+            
+            # Extract the base symbol (e.g., "BTC" from "BTC/USDC:USDC")
+            base_symbol = symbol.split('/')[0]
+            symbol_formats.append(base_symbol)
+        else:
+            # Symbol is in base format like "BTC"
+            base_symbol = symbol
+            symbol_formats = [symbol, f"{symbol}/USDC:USDC"]
+        
+        # Try each format until one works
+        for format_idx, sym_format in enumerate(symbol_formats):
+            try:
+                debug_info[f'trying_format_{symbol}_{format_idx}'] = sym_format
+                ohlcv = await async_api_request(info.candles_snapshot, sym_format, timeframe, start_time, end_time)
+                if ohlcv and len(ohlcv) > 0:
+                    debug_info[f'candles_success_{symbol}'] = f'Found data using format: {sym_format}'
+                    break  # We found valid data, exit the loop
+                else:
+                    errors.append(f"Empty response for format {sym_format}")
+            except Exception as e:
+                error_msg = f"Error with format {sym_format}: {str(e)}"
+                errors.append(error_msg)
+                debug_info[f'candles_format_error_{symbol}_{format_idx}'] = error_msg
+        
         if not ohlcv or len(ohlcv) == 0:
-            debug_info[f'candles_empty_{symbol}'] = 'No candle data returned'
-            logging.warning(f"No candle data for {symbol}")
+            debug_info[f'candles_empty_{symbol}'] = f'No candle data returned for any format. Errors: {errors}'
+            logging.warning(f"No candle data for {symbol}. Tried formats: {symbol_formats}")
             st.session_state.debug_info = debug_info
             return None
+            
         parsed_ohlcv = parse_candles(ohlcv)
         df = pd.DataFrame(parsed_ohlcv, columns=['timestamp', 'time_close', 'symbol', 'interval', 'open', 'close', 'high', 'low', 'volume', 'num'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -825,9 +912,7 @@ async def generate_signals(markets_df):
     micro_price_calc = MicroPrice(alpha=2.0, volatility_factor=1.0)
     progress_bar = st.progress(0)
     status_text = st.empty()
-    MICRO_PRICE_THRESHOLD = 0.001
-
-    async def process_market(index, market):
+    MICRO_PRICE_THRESHOLD = 0.001    async def process_market(index, market):
         symbol = market['symbol']
         perp_symbol = f"{symbol}/USDC:USDC"
         status_text.text(f"Analyzing {symbol}... ({index + 1}/{total_markets})")
@@ -854,7 +939,8 @@ async def generate_signals(markets_df):
             mid_price = (best_bid + best_ask) / 2
             spread = best_ask - best_bid
             spread_bps = (spread / mid_price) * 10000
-            df = await fetch_hyperliquid_candles(perp_symbol, interval='1h', limit=48)
+            # Use base symbol for candles to avoid format issues
+            df = await fetch_hyperliquid_candles(symbol, interval='1h', limit=48)
             if df is None or len(df) < 6:
                 debug_info[f'no_candles_{symbol}'] = 'Insufficient candle data'
                 st.session_state.debug_info = debug_info
@@ -995,8 +1081,7 @@ with st.sidebar:
     
     MIN_LIQUIDITY = liquidity_options[selected_liquidity]
     st.session_state.MIN_LIQUIDITY = MIN_LIQUIDITY
-    
-    with st.expander("Advanced Settings"):
+      with st.expander("Advanced Settings"):
         st.session_state.use_orderbook_fallback = st.checkbox(
             "Use orderbook fallback",
             value=True,
@@ -1008,13 +1093,33 @@ with st.sidebar:
             min_value=1000.0,
             step=1000.0
         )
+        
+        st.subheader("Rate Limiting Settings")
+        st.write("Adjust these settings to avoid hitting API rate limits")
+        
         api_calls_per_second = st.slider(
             "API calls per second",
+            min_value=1.0,
+            max_value=10.0,
+            value=3.0,
+            step=0.5,
+            help="Maximum API calls per second. Lower values help prevent 429 rate limit errors."
+        )
+        
+        max_retries = st.slider(
+            "Max retries",
             min_value=1,
             max_value=10,
-            value=4
+            value=5,
+            help="Maximum number of retry attempts when API requests fail"
         )
+        
+        st.caption("Rate limiter configured successfully. The app will automatically use exponential backoff with jitter for retries.")
+        
+        # Update the rate limiter
         rate_limiter.calls_per_second = api_calls_per_second
+        # Store the max retries in session state for use in api_request_with_retry
+        st.session_state.api_max_retries = max_retries
         FUNDING_THRESHOLD = st.slider("Funding Rate Threshold (basis points)", 10, 200, 60, 5)
     
     with st.expander("Debugging Tools"):
