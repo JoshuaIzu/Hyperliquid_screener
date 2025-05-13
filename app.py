@@ -127,19 +127,6 @@ class Trade(BaseModel):
     exit_time: Optional[str] = None
     pct_change: Optional[float] = None
 
-# ======================== CONFIGURATION ========================
-BASE_VOL = 0.35
-MIN_LIQUIDITY = st.session_state.MIN_LIQUIDITY
-FUNDING_THRESHOLD = 60
-BATCH_SIZE = 50
-
-# Initialize Hyperliquid Info client
-@st.cache_resource
-def init_hyperliquid():
-    return Info(skip_ws=True)
-
-info = init_hyperliquid()
-
 # ======================== UTILITY CLASSES ========================
 class RateLimiter:
     def __init__(self, calls_per_second=4):
@@ -154,9 +141,6 @@ class RateLimiter:
             sleep_time = self.min_interval - elapsed
             time.sleep(sleep_time)
         self.last_call_time = time.time()
-
-rate_limiter = RateLimiter(calls_per_second=4)
-volume_fetcher = VolumeFetcher(info, rate_limit_calls_per_second=4)
 
 class VolumeFetcher:
     def __init__(self, info_client: Info, rate_limit_calls_per_second: int = 4):
@@ -278,6 +262,23 @@ class MicroPrice:
         adjustment = spread * math.tanh(effective_alpha * delta)
         micro_price = mid_price + adjustment
         return max(best_bid, min(best_ask, micro_price))
+
+# ======================== CONFIGURATION ========================
+BASE_VOL = 0.35
+MIN_LIQUIDITY = st.session_state.MIN_LIQUIDITY
+FUNDING_THRESHOLD = 60
+BATCH_SIZE = 50
+
+# Initialize Hyperliquid Info client
+@st.cache_resource
+def init_hyperliquid():
+    return Info(skip_ws=True)
+
+info = init_hyperliquid()
+
+# Instantiate VolumeFetcher after its definition
+rate_limiter = RateLimiter(calls_per_second=4)
+volume_fetcher = VolumeFetcher(info, rate_limit_calls_per_second=4)
 
 # ======================== PARSERS FOR RAW API DATA ========================
 def parse_orderbook_levels(raw_levels):
