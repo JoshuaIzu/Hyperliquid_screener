@@ -707,101 +707,70 @@ def generate_signals(markets_df):
         st.session_state.debug_info['signals_error'] = 'Empty markets DataFrame'
         logging.warning("No market data for signal generation")
         return []
-    
     signals = []
     top_markets = markets_df.head(15)
     total_markets = len(top_markets)
-    
-    # Initialize MicroPrice calculator with dynamic volatility adjustment
     micro_price_calc = MicroPrice(alpha=2.0, volatility_factor=1.0)
-    
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
-    # Micro-price threshold as percentage of price
-    MICRO_PRICE_THRESHOLD = 0.001  # 0.1% threshold for signal generation
-    
+    MICRO_PRICE_THRESHOLD = 0.001
     for i, (index, market) in enumerate(top_markets.iterrows()):
         symbol = market['symbol']
+        perp_symbol = f"{symbol}/USDC:USDC"
         status_text.text(f"Analyzing {symbol}... ({i+1}/{total_markets})")
-        
-        # Get order book data for micro-price calculation
         try:
-            book_response = api_request_with_retry(info.l2_snapshot, symbol)
+            book_response = api_request_with_retry(info.l2_snapshot, perp_symbol)
             if not book_response or 'levels' not in book_response:
                 continue
-            
-            book = OrderBook(**book_response)
+            parsed_levels = parse_orderbook_levels(book_response['levels'])
+            book = OrderBook(levels=parsed_levels)
             bids = [level for level in book.levels if level.side == 'b']
             asks = [level for level in book.levels if level.side == 'a']
-            
             if not bids or not asks:
                 continue
-            
             best_bid = bids[0].price
             best_ask = asks[0].price
             bid_size = bids[0].size
             ask_size = asks[0].size
-            
-            # Calculate micro-price
             micro_price = micro_price_calc.calculate(best_bid, best_ask, bid_size, ask_size)
             mid_price = (best_bid + best_ask) / 2
             spread = best_ask - best_bid
-            spread_bps = (spread / mid_price) * 10000  # Convert to basis points
-            
-            # Get historical candle data
-            df = fetch_hyperliquid_candles(symbol, interval='1h', limit=48)
+            spread_bps = (spread / mid_price) * 10000
+            df = fetch_hyperliquid_candles(perp_symbol, interval='1h', limit=48)
             if df is None or len(df) < 6:
                 st.session_state.debug_info[f'no_candles_{symbol}'] = 'Insufficient candle data'
                 logging.warning(f"Insufficient candle data for {symbol}")
                 continue
-            
-            # Volume analysis
             recent_vols = df['volume'].tail(3)
             avg_vol = df['volume'].mean()
             recent_vol = recent_vols.mean()
             vol_surge = recent_vol / avg_vol if avg_vol > 0 else 0
             vol_consistent = all(v > avg_vol * 0.7 for v in recent_vols)
-            
-            # Volatility calculation for dynamic TP/SL
             df['hlrange'] = df['high'] - df['low']
             avg_range = df['hlrange'].mean()
             volatility_factor = min(max(avg_range / df['close'].iloc[-1], 0.01), 0.05)
-            
             signal = "HOLD"
             reason = ""
             tp = "-"
             sl = "-"
-            
             funding_rate = market['fundingRate']
             current_price = df['close'].iloc[-1]
-            
-            # Combined signal logic using micro-price, volume, spread, and funding rate
             micro_price_deviation = (micro_price - mid_price) / mid_price
-            
-            # Calculate dynamic thresholds based on volatility
             price_threshold = max(MICRO_PRICE_THRESHOLD, volatility_factor * 0.5)
-            max_spread_bps = 50  # Maximum acceptable spread in basis points
-            
-            # Dynamic TP/SL distances based on volatility and spread
-            tp_distance = max(volatility_factor * 5, 0.02)  # Minimum 2% TP
-            sl_distance = max(volatility_factor * 3, 0.015)  # Minimum 1.5% SL
-            
-            # Signal generation combining all factors
+            max_spread_bps = 50
+            tp_distance = max(volatility_factor * 5, 0.02)
+            sl_distance = max(volatility_factor * 3, 0.015)
             if spread_bps <= max_spread_bps and vol_surge >= 1.5 and vol_consistent:
                 if micro_price_deviation > price_threshold and funding_rate < -FUNDING_THRESHOLD:
                     signal = "LONG"
                     reason = f"Micro-price above mid: {micro_price_deviation:.4f}, Vol surge {vol_surge:.2f}x, Funding {funding_rate:.2f} bps"
                     tp = str(round(current_price * (1 + tp_distance), 4))
                     sl = str(round(current_price * (1 - sl_distance), 4))
-                
                 elif micro_price_deviation < -price_threshold and funding_rate > FUNDING_THRESHOLD:
                     signal = "SHORT"
                     reason = f"Micro-price below mid: {micro_price_deviation:.4f}, Vol surge {vol_surge:.2f}x, Funding {funding_rate:.2f} bps"
                     tp = str(round(current_price * (1 - tp_distance), 4))
                     sl = str(round(current_price * (1 + sl_distance), 4))
-            
-            # Add signal to results
             signals.append(Signal(
                 Symbol=symbol,
                 Price=current_price,
@@ -815,13 +784,10 @@ def generate_signals(markets_df):
                 TP=tp,
                 SL=sl
             ))
-        
         except Exception as e:
             logging.error(f"Error analyzing {symbol}: {str(e)}")
             continue
-        
         progress_bar.progress((i + 1) / total_markets)
-    
     progress_bar.empty()
     status_text.empty()
     st.session_state.debug_info['signals_generated'] = len(signals)
