@@ -304,52 +304,75 @@ def estimate_volume_from_orderbook(symbol):
         logging.error(f"Volume estimation failed for {symbol}: {str(e)}")
         return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
 
-# ======================== DATA FETCHING ========================
+# ======================== API CONNECTION VALIDATION ========================
+def validate_api_responses():
+    """Validate API connections and log issues."""
+    try:
+        meta_response = api_request_with_retry(info.meta)
+        if not meta_response or 'universe' not in meta_response:
+            st.session_state.debug_info['meta_error'] = 'Invalid or empty meta response'
+            logging.error("Failed to fetch market metadata")
+            return False
+
+        all_prices = api_request_with_retry(info.all_mids)
+        if not all_prices or not isinstance(all_prices, dict):
+            st.session_state.debug_info['mids_error'] = 'Invalid or empty mids response'
+            logging.error("Failed to fetch mid prices")
+            return False
+
+        return True
+    except Exception as e:
+        st.session_state.debug_info['api_validation_error'] = str(e)
+        logging.error(f"API validation failed: {str(e)}")
+        return False
+
+# ======================== FALLBACK LOGIC FOR MAJOR COINS ========================
+def apply_fallback_for_major_coins():
+    """Provide fallback data for major coins if no markets meet the liquidity threshold."""
+    st.info("Using fallback data for major coins.")
+    fallback_data = [
+        MarketInfo(name='BTC', markPrice=83000, lastPrice=83000, fundingRate=5, volume24h=500000, change24h=1.2),
+        MarketInfo(name='ETH', markPrice=3000, lastPrice=3000, fundingRate=10, volume24h=300000, change24h=0.8),
+        MarketInfo(name='SOL', markPrice=150, lastPrice=150, fundingRate=15, volume24h=100000, change24h=2.5)
+    ]
+    return pd.DataFrame([m.dict() for m in fallback_data])
+
+# ======================== UPDATED FETCH ALL MARKETS ========================
 @st.cache_data(ttl=300)
 def fetch_all_markets():
     try:
         logging.info("Starting market fetch")
         debug_info = st.session_state.debug_info
-        
+
+        # Validate API connections
+        if not validate_api_responses():
+            st.error("API validation failed. Check debug info.")
+            return pd.DataFrame()
+
         # Fetch market metadata
         meta_response = api_request_with_retry(info.meta)
-        if not meta_response or 'universe' not in meta_response:
-            debug_info['meta_error'] = 'Invalid or empty meta response'
-            st.error("Failed to fetch market metadata")
-            logging.error("Failed to fetch market metadata")
-            st.session_state.debug_info = debug_info
-            return pd.DataFrame()
-        
         meta = MarketUniverse(**meta_response)
         debug_info['total_markets'] = len(meta.universe)
         if not meta.universe:
             debug_info['meta_empty'] = 'No markets in universe'
             st.warning("No markets found in metadata")
-            logging.warning("No markets found in metadata")
-            st.session_state.debug_info = debug_info
             return pd.DataFrame()
-        
+
         # Fetch mid prices
         all_prices = api_request_with_retry(info.all_mids)
-        if not all_prices or not isinstance(all_prices, dict):
-            debug_info['mids_error'] = 'Invalid or empty mids response'
-            st.error("Failed to fetch mid prices")
-            logging.error("Failed to fetch mid prices")
-            st.session_state.debug_info = debug_info
-            return pd.DataFrame()
-        
+
         market_data = []
         skipped_markets = []
-        
+
         progress = st.progress(0)
         status = st.empty()
-        
+
         for i, coin in enumerate(meta.universe):
             symbol = coin['name']
             try:
                 progress.progress((i + 1) / len(meta.universe))
                 status.text(f"Processing {i+1}/{len(meta.universe)}: {symbol}")
-                
+
                 # Fetch mid price
                 price = safe_float(all_prices.get(symbol))
                 if not price:
@@ -360,7 +383,7 @@ def fetch_all_markets():
                     })
                     debug_info[f'skip_no_price_{symbol}'] = 'Missing price'
                     continue
-                
+
                 # Estimate volume
                 volume_24h = estimate_volume_from_orderbook(symbol)
                 if volume_24h < MIN_LIQUIDITY:
@@ -375,7 +398,7 @@ def fetch_all_markets():
                         })
                         debug_info[f'skip_low_volume_{symbol}'] = f'Volume {volume_24h} < {MIN_LIQUIDITY}'
                         continue
-                
+
                 # Fetch funding rate
                 funding_rate = 0
                 try:
@@ -388,7 +411,7 @@ def fetch_all_markets():
                 except Exception as e:
                     debug_info[f'funding_error_{symbol}'] = str(e)
                     logging.error(f"Funding rate fetch failed for {symbol}: {str(e)}")
-                
+
                 # Calculate 24-hour price change
                 change_24h = 0
                 try:
@@ -407,7 +430,7 @@ def fetch_all_markets():
                 except Exception as e:
                     debug_info[f'candles_error_{symbol}'] = str(e)
                     logging.error(f"Candles fetch failed for {symbol}: {str(e)}")
-                
+
                 market_data.append(MarketInfo(
                     name=symbol,
                     markPrice=price,
@@ -416,38 +439,32 @@ def fetch_all_markets():
                     volume24h=volume_24h,
                     change24h=change_24h,
                 ))
-                
+
             except Exception as e:
                 debug_info[f'error_{symbol}'] = str(e)
                 logging.error(f"Processing failed for {symbol}: {str(e)}")
                 continue
-        
+
         progress.empty()
         status.empty()
-        
+
         df = pd.DataFrame([m.dict() for m in market_data])
-        
+
         if df.empty:
             debug_info['empty_result'] = True
             debug_info['min_liquidity'] = MIN_LIQUIDITY
             st.warning(f"No markets met the minimum liquidity threshold of ${MIN_LIQUIDITY:,}.")
             logging.warning(f"No markets met liquidity threshold of ${MIN_LIQUIDITY:,}")
             if st.session_state.get('force_include_major', False):
-                st.info("Using fallback data for major coins.")
-                fallback_data = [
-                    MarketInfo(name='BTC', markPrice=83000, lastPrice=83000, fundingRate=5, volume24h=500000, change24h=1.2),
-                    MarketInfo(name='ETH', markPrice=3000, lastPrice=3000, fundingRate=10, volume24h=300000, change24h=0.8),
-                    MarketInfo(name='SOL', markPrice=150, lastPrice=150, fundingRate=15, volume24h=100000, change24h=2.5)
-                ]
-                df = pd.DataFrame([m.dict() for m in fallback_data])
-        
+                return apply_fallback_for_major_coins()
+
         debug_info['markets_processed'] = len(market_data)
         debug_info['markets_skipped'] = len(skipped_markets)
         debug_info['skipped_samples'] = skipped_markets[:5]
         st.session_state.debug_info = debug_info
-        
+
         return df.sort_values('volume24h', ascending=False) if not df.empty else pd.DataFrame()
-    
+
     except Exception as e:
         debug_info['critical_error'] = str(e)
         st.session_state.debug_info = debug_info
@@ -455,6 +472,7 @@ def fetch_all_markets():
         logging.error(f"Critical error fetching markets: {str(e)}")
         return pd.DataFrame()
 
+# ======================== DATA FETCHING ========================
 @st.cache_data(ttl=300)
 def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
     try:
@@ -1040,8 +1058,7 @@ with tab4:
                     completed_df,
                     x='pct_change',
                     nbins=20,
-                    title="P&L Distribution",
-                    labels={'pct_change': 'P&L (%)'}
+                    title="P&L Distribution"
                 )
                 st.plotly_chart(fig, use_container_width=True)
     else:
@@ -1072,11 +1089,10 @@ with tab5:
             try:
                 import shutil
                 backup_file = f"trading_state_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-                shutil.copy2('trading_state.db', backup_file)
-                st.success(f"Database backed up to {backup_file}")
+                shutil.copy('trading_state.db', backup_file)
+                st.success(f"Database backed up as {backup_file}")
             except Exception as e:
-                st.error(f"Backup failed: {str(e)}")
-                logging.error(f"Database backup failed: {str(e)}")
+                st.error(f"Failed to backup database: {str(e)}")
         if st.button("Clear Cache"):
             try:
                 if os.path.exists('market_cache.db'):
