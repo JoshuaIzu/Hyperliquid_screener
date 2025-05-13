@@ -49,7 +49,6 @@ def init_session_state():
     if 'MIN_LIQUIDITY' not in st.session_state:
         st.session_state.MIN_LIQUIDITY = 1000
 
-# Call initialization at the start of the script
 init_session_state()
 
 # ======================== PYDANTIC MODELS ========================
@@ -132,7 +131,7 @@ class Trade(BaseModel):
 BASE_VOL = 0.35
 MIN_LIQUIDITY = st.session_state.MIN_LIQUIDITY
 FUNDING_THRESHOLD = 60
-BATCH_SIZE = 50  # Process ~50 coins per batch (195 / 4 ≈ 49)
+BATCH_SIZE = 50
 
 # Initialize Hyperliquid Info client
 @st.cache_resource
@@ -143,7 +142,7 @@ info = init_hyperliquid()
 
 # ======================== UTILITY CLASSES ========================
 class RateLimiter:
-    def __init__(self, calls_per_second=5):
+    def __init__(self, calls_per_second=4):
         self.calls_per_second = calls_per_second
         self.min_interval = 1.0 / calls_per_second
         self.last_call_time = 0
@@ -156,11 +155,9 @@ class RateLimiter:
             time.sleep(sleep_time)
         self.last_call_time = time.time()
 
-rate_limiter = RateLimiter(calls_per_second=5)
+rate_limiter = RateLimiter(calls_per_second=4)
 
 class MicroPrice:
-    """Class for calculating micro-price using a stochastic Stoikov-inspired model."""
-    
     def __init__(self, alpha: float = 2.0, volatility_factor: float = 1.0):
         self.alpha = alpha
         self.volatility_factor = volatility_factor
@@ -211,11 +208,11 @@ def parse_candles(raw_candles):
                 'time_close': candle.get('T', 0),
                 'symbol': candle.get('s', ''),
                 'interval': candle.get('i', ''),
-                'open': safe_float(candle.get('o')),
-                'close': safe_float(candle.get('c')),
-                'high': safe_float(candle.get('h')),
-                'low': safe_float(candle.get('l')),
-                'volume': safe_float(candle.get('v')),
+                'open': safe_float(candle.get('o'), 0.0),
+                'close': safe_float(candle.get('c'), 0.0),
+                'high': safe_float(candle.get('h'), 0.0),
+                'low': safe_float(candle.get('l'), 0.0),
+                'volume': safe_float(candle.get('v'), 0.0),
                 'num': candle.get('n', 0)
             })
         else:
@@ -251,6 +248,10 @@ def safe_float(value, default=0.0):
         return float(value)
     except (ValueError, TypeError):
         return default
+
+def validate_symbol(symbol, meta_universe):
+    base_symbol = symbol.split('/')[0] if '/' in symbol else symbol
+    return any(coin.name == base_symbol for coin in meta_universe)
 
 def estimate_volume_from_orderbook(symbol, meta_data=None):
     try:
@@ -383,6 +384,16 @@ async def fetch_all_markets():
                 perp_symbol = f"{symbol}/USDC:USDC"
                 debug_info = getattr(st.session_state, 'debug_info', {})
                 try:
+                    if not validate_symbol(perp_symbol, meta.universe):
+                        batch_skipped.append({
+                            'symbol': symbol,
+                            'reason': 'Invalid or unsupported symbol',
+                            'min_required': MIN_LIQUIDITY
+                        })
+                        debug_info[f'invalid_symbol_{symbol}'] = f'Unsupported symbol: {perp_symbol}'
+                        st.session_state.debug_info = debug_info
+                        return None
+
                     price = safe_float(all_prices.get(symbol))
                     if not price:
                         batch_skipped.append({
@@ -430,7 +441,10 @@ async def fetch_all_markets():
                     # Fetch funding rate
                     funding_rate = 10.0 if symbol in ["BTC", "ETH", "SOL"] else 5.0
                     try:
-                        funding_response = await async_api_request(info.funding_history, perp_symbol)
+                        end_time = int(datetime.now().timestamp() * 1000)
+                        start_time = end_time - (24 * 60 * 60 * 1000)
+                        funding_response = await async_api_request(info.funding_history, symbol, start_time)
+                        debug_info[f'funding_response_{symbol}'] = str(funding_response)
                         if funding_response and isinstance(funding_response, list) and len(funding_response) > 0:
                             for entry in funding_response[:5]:
                                 try:
@@ -454,9 +468,10 @@ async def fetch_all_markets():
                     change_24h = 1.0 if symbol in ["BTC", "ETH", "SOL"] else 0.5
                     try:
                         end_time = int(datetime.now().timestamp() * 1000)
-                        start_time = end_time - (26 * 60 * 60 * 1000)
+                        start_time = end_time - (48 * 60 * 60 * 1000)
                         for timeframe in ['1h', '4h', '1d']:
                             candles_response = await async_api_request(info.candles_snapshot, perp_symbol, timeframe, start_time, end_time)
+                            debug_info[f'candles_response_{symbol}_{timeframe}'] = str(candles_response)
                             if candles_response and isinstance(candles_response, list) and len(candles_response) >= 2:
                                 parsed_candles = parse_candles(candles_response)
                                 candles = [CandleData(**candle) for candle in parsed_candles]
@@ -561,13 +576,9 @@ async def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
         timeframe_map = {'1h': '1h', '4h': '4h', '1d': '1d'}
         timeframe = timeframe_map.get(interval, '1h')
         end_time = int(datetime.now().timestamp() * 1000)
-        if interval == '1h':
-            start_time = end_time - (limit * 60 * 60 * 1000)
-        elif interval == '4h':
-            start_time = end_time - (limit * 4 * 60 * 60 * 1000)
-        else:
-            start_time = end_time - (limit * 24 * 60 * 60 * 1000)
+        start_time = end_time - (48 * 60 * 60 * 1000)
         ohlcv = await async_api_request(info.candles_snapshot, symbol, timeframe, start_time, end_time)
+        debug_info[f'candles_response_{symbol}_{timeframe}'] = str(ohlcv)
         if not ohlcv or len(ohlcv) == 0:
             debug_info[f'candles_empty_{symbol}'] = 'No candle data returned'
             logging.warning(f"No candle data for {symbol}")
@@ -962,7 +973,7 @@ with st.sidebar:
             "API calls per second",
             min_value=1,
             max_value=10,
-            value=5
+            value=4
         )
         rate_limiter.calls_per_second = api_calls_per_second
         FUNDING_THRESHOLD = st.slider("Funding Rate Threshold (basis points)", 10, 200, 60, 5)
@@ -1236,6 +1247,18 @@ with tab6:
                 except Exception as e:
                     st.error(f"❌ Candles test failed: {str(e)}")
                     logging.error(f"Candles test failed for {sample_symbol}: {str(e)}")
+                try:
+                    end_time = int(datetime.now().timestamp() * 1000)
+                    start_time = end_time - (24 * 60 * 60 * 1000)
+                    funding = info.funding_history(sample_symbol, start_time)
+                    if funding and isinstance(funding, list):
+                        st.success(f"✅ Successfully fetched funding history for {sample_symbol}")
+                        st.write(f"Found {len(funding)} funding records")
+                    else:
+                        st.error(f"❌ Failed to fetch valid funding history for {sample_symbol}")
+                except Exception as e:
+                    st.error(f"❌ Funding history test failed: {str(e)}")
+                    logging.error(f"Funding history test failed for {sample_symbol}: {str(e)}")
         except Exception as e:
             st.error(f"❌ Hyperliquid connection test failed: {str(e)}")
             logging.error(f"Hyperliquid connection test failed: {str(e)}")
