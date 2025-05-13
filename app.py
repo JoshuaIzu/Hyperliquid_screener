@@ -233,6 +233,36 @@ class MicroPrice:
         
         return micro_price
 
+# ======================== PARSERS FOR RAW API DATA ========================
+def parse_orderbook_levels(raw_levels):
+    parsed = []
+    for level in raw_levels:
+        if isinstance(level, dict):
+            parsed.append(level)
+        elif isinstance(level, (list, tuple)) and len(level) == 3:
+            parsed.append({'side': level[0], 'price': float(level[1]), 'size': float(level[2])})
+    return parsed
+
+def parse_candles(raw_candles):
+    parsed = []
+    for candle in raw_candles:
+        if isinstance(candle, dict):
+            parsed.append(candle)
+        elif isinstance(candle, (list, tuple)) and len(candle) == 10:
+            parsed.append({
+                'timestamp': candle[0],
+                'time_close': candle[1],
+                'symbol': candle[2],
+                'interval': candle[3],
+                'open': candle[4],
+                'close': candle[5],
+                'high': candle[6],
+                'low': candle[7],
+                'volume': candle[8],
+                'num': candle[9],
+            })
+    return parsed
+
 # ======================== HELPER FUNCTIONS ========================
 def api_request_with_retry(func, *args, max_retries=3, **kwargs):
     for attempt in range(max_retries):
@@ -261,43 +291,34 @@ def estimate_volume_from_orderbook(symbol):
         if not book_response or 'levels' not in book_response:
             st.session_state.debug_info[f'volume_empty_{symbol}'] = 'Empty or invalid order book'
             return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
-        
-        book = OrderBook(**book_response)
+        raw_levels = book_response['levels']
+        parsed_levels = parse_orderbook_levels(raw_levels)
+        book = OrderBook(levels=parsed_levels)
         if len(book.levels) < 2:
             st.session_state.debug_info[f'volume_sparse_{symbol}'] = 'Insufficient order book levels'
             return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
-        
         bids = [level for level in book.levels if level.side == 'b']
         asks = [level for level in book.levels if level.side == 'a']
-        
         if not bids or not asks:
             st.session_state.debug_info[f'volume_no_bids_asks_{symbol}'] = 'No bids or asks in order book'
             return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
-        
         top_bids = sorted(bids, key=lambda x: -x.price)[:5]
         top_asks = sorted(asks, key=lambda x: x.price)[:5]
-        
         bid_liquidity = sum(bid.size for bid in top_bids)
         ask_liquidity = sum(ask.size for ask in top_asks)
-        
         bid_price = top_bids[0].price if top_bids else 0
         ask_price = top_asks[0].price if top_asks else 0
-        
         if bid_price <= 0 or ask_price <= 0 or bid_liquidity <= 0 or ask_liquidity <= 0:
             st.session_state.debug_info[f'volume_invalid_{symbol}'] = 'Invalid prices or liquidity'
             return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
-        
         if bid_price > ask_price:
             bid_price, ask_price = ask_price, bid_price
-        
         mid_price = (bid_price + ask_price) / 2
         bid_value = bid_liquidity * mid_price
         ask_value = ask_liquidity * mid_price
         total_liquidity_value = bid_value + ask_value
-        
         volume_multiplier = 20 if symbol in ["BTC", "ETH"] else 10
         volume = total_liquidity_value * volume_multiplier
-        
         return max(volume, 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000)
     except Exception as e:
         st.session_state.debug_info[f'volume_error_{symbol}'] = str(e)
@@ -402,7 +423,7 @@ def fetch_all_markets():
                 # Fetch funding rate
                 funding_rate = 0
                 try:
-                    funding_response = api_request_with_retry(info.funding_history, symbol, limit=1)
+                    funding_response = api_request_with_retry(info.funding_history, symbol)
                     if funding_response and isinstance(funding_response, list) and len(funding_response) > 0:
                         funding_data = FundingRate(**funding_response[0])
                         funding_rate = safe_float(funding_data.fundingRate) * 10000 * 3 * 365
@@ -419,7 +440,8 @@ def fetch_all_markets():
                     start_time = end_time - (24 * 60 * 60 * 1000)
                     candles_response = api_request_with_retry(info.candles_snapshot, symbol, '1h', start_time, end_time)
                     if candles_response and isinstance(candles_response, list) and len(candles_response) > 0:
-                        candles = [CandleData(**candle) for candle in candles_response]
+                        parsed_candles = parse_candles(candles_response)
+                        candles = [CandleData(**candle) for candle in parsed_candles]
                         if len(candles) > 1:
                             oldest_price = safe_float(candles[0].open)
                             latest_price = safe_float(candles[-1].close)
@@ -495,7 +517,8 @@ def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
             logging.warning(f"No candle data for {symbol}")
             return None
         
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'time_close', 'symbol', 'interval', 'open', 'close', 'high', 'low', 'volume', 'num'])
+        parsed_ohlcv = parse_candles(ohlcv)
+        df = pd.DataFrame(parsed_ohlcv, columns=['timestamp', 'time_close', 'symbol', 'interval', 'open', 'close', 'high', 'low', 'volume', 'num'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
         return df
@@ -1199,10 +1222,11 @@ with tab6:
     
     st.subheader("Rate Limiter Settings")
     current_rate = st.session_state.get('api_rate', rate_limiter.calls_per_second)
-    new_rate = st.slider("API calls per second", 1, 10, int(current_rate), 1)
-    if new_rate != current_rate:
-        rate_limiter.calls_per_second = new_rate
-        st.session_state.api_rate = new_rate
-        st.success(f"Rate limiter updated to {new_rate} calls per second")
+    rate = st.slider("API calls per second", 1, 10, int(current_rate), 1)
+    if rate != current_rate:
+        rate_limiter.calls_per_second = rate
+        st.session_state.api_rate = rate
+        st.success(f"Rate limiter updated to {rate} calls per second")
     
     st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+``` 
