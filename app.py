@@ -409,12 +409,25 @@ async def fetch_all_markets():
                     volume_24h = 10000
                     try:
                         context_response = await async_api_request(info.meta_and_asset_ctxs)
+                        debug_info[f'context_response_{symbol}'] = str(context_response)[:500]  # Log first 500 chars of response
                         if context_response and isinstance(context_response, list):
+                            found = False
                             for ctx in context_response:
-                                if ctx.get('universe', {}).get('name') == symbol:
+                                # Ensure ctx is a dictionary before proceeding
+                                if not isinstance(ctx, dict):
+                                    debug_info[f'volume_direct_error_{symbol}'] = f"Unexpected ctx type: {type(ctx)}"
+                                    continue
+                                universe = ctx.get('universe', {})
+                                if not isinstance(universe, dict):
+                                    debug_info[f'volume_direct_error_{symbol}'] = f"Unexpected universe type: {type(universe)}"
+                                    continue
+                                if universe.get('name') == symbol:
                                     volume_24h = safe_float(ctx.get('dayNtlV', 0)) * price
                                     debug_info[f'volume_direct_{symbol}'] = f'Direct volume: ${volume_24h:.2f}'
+                                    found = True
                                     break
+                            if not found:
+                                debug_info[f'volume_direct_not_found_{symbol}'] = f'No matching symbol in context_response'
                     except Exception as e:
                         debug_info[f'volume_direct_error_{symbol}'] = str(e)
 
@@ -559,7 +572,10 @@ async def fetch_all_markets():
         debug_info['skipped_samples'] = skipped_markets[:5]
         st.session_state.debug_info = debug_info
 
-        return df.sort_values('volume24h', ascending=False) if not df.empty else pd.DataFrame()
+        # Sort by volume24h descending as the default
+        sorted_df = df.sort_values('volume24h', ascending=False)
+        debug_info['sorted_columns'] = f"Sorted by volume24h: {sorted_df[['symbol', 'volume24h']].head().to_dict()}"
+        return sorted_df
 
     except Exception as e:
         debug_info = getattr(st.session_state, 'debug_info', {})
@@ -1010,15 +1026,23 @@ with tab1:
         scan_markets()
     if not st.session_state.scanned_markets.empty:
         st.subheader("All Markets")
+        # Rename columns for better display and ensure consistency
+        display_df = st.session_state.scanned_markets.rename(columns={
+            'symbol': 'Symbol',
+            'markPrice': 'Mark Price',
+            'volume24h': 'Volume (24h)',
+            'fundingRate': 'Funding Rate (bps)',
+            'change24h': 'Change (24h)'
+        })
         st.dataframe(
-            st.session_state.scanned_markets,
+            display_df,
             use_container_width=True,
             column_config={
-                'symbol': st.column_config.TextColumn("Symbol"),
-                'markPrice': st.column_config.NumberColumn("Mark Price", format="%.4f"),
-                'volume24h': st.column_config.NumberColumn("24h Volume", format="$%.2f"),
-                'fundingRate': st.column_config.NumberColumn("Funding Rate (bps)", format="%.2f"),
-                'change24h': st.column_config.NumberColumn("24h Change", format="%.2f%%")
+                'Symbol': st.column_config.TextColumn("Symbol"),
+                'Mark Price': st.column_config.NumberColumn("Mark Price", format="%.4f"),
+                'Volume (24h)': st.column_config.NumberColumn("Volume (24h)", format="$%.2f"),
+                'Funding Rate (bps)': st.column_config.NumberColumn("Funding Rate (bps)", format="%.2f"),
+                'Change (24h)': st.column_config.NumberColumn("Change (24h)", format="%.2f%%")
             }
         )
     if st.session_state.signals:
