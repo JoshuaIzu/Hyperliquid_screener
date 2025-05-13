@@ -8,10 +8,15 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import sqlite3
 import time
+import logging
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict, Any
+import math
+
+# Set up logging
+logging.basicConfig(filename='hyperliquid_screener.log', level=logging.DEBUG)
 
 # Set page config
 st.set_page_config(
@@ -46,7 +51,7 @@ class MarketMeta(BaseModel):
     minSize: Optional[float] = None
 
 class MarketUniverse(BaseModel):
-    universe: List[Dict[str, Any]]  # Changed to accept any dictionary structure
+    universe: List[Dict[str, Any]]
 
 class CandleData(BaseModel):
     timestamp: int
@@ -103,7 +108,7 @@ class Trade(BaseModel):
 # ======================== CONFIGURATION ========================
 BASE_VOL = 0.35
 VOL_MULTIPLIER = 1.5
-MIN_LIQUIDITY = 50000  # Fallback value
+MIN_LIQUIDITY = 5000  # Lowered default for broader market inclusion
 if 'MIN_LIQUIDITY' not in st.session_state:
     st.session_state.MIN_LIQUIDITY = MIN_LIQUIDITY
 FUNDING_THRESHOLD = 60  # Annualized funding rate threshold (in basis points)
@@ -125,7 +130,7 @@ if 'debug_info' not in st.session_state:
 
 # ======================== UTILITY CLASSES ========================
 class RateLimiter:
-    def __init__(self, calls_per_second=2):
+    def __init__(self, calls_per_second=2):  # Conservative default
         self.calls_per_second = calls_per_second
         self.min_interval = 1.0 / calls_per_second
         self.last_call_time = 0
@@ -133,23 +138,111 @@ class RateLimiter:
     def wait(self):
         current_time = time.time()
         elapsed = current_time - self.last_call_time
-        
         if elapsed < self.min_interval:
             sleep_time = self.min_interval - elapsed
             time.sleep(sleep_time)
-        
         self.last_call_time = time.time()
 
-rate_limiter = RateLimiter(calls_per_second=3)
+rate_limiter = RateLimiter(calls_per_second=2)
+
+class MicroPrice:
+    """Class for calculating micro-price using a stochastic Stoikov-inspired model."""
+    
+    def __init__(self, alpha: float = 2.0, volatility_factor: float = 1.0):
+        """
+        Initialize MicroPrice calculator.
+        
+        Args:
+            alpha (float): Sensitivity parameter for imbalance (default: 2.0).
+            volatility_factor (float): Scaling factor for market volatility (default: 1.0).
+        """
+        self.validate_params(alpha, volatility_factor)
+        self.alpha = alpha
+        self.volatility_factor = volatility_factor
+    
+    @staticmethod
+    def validate_params(alpha: float, volatility_factor: float):
+        """Validate initialization parameters."""
+        if not all(isinstance(x, (int, float)) for x in [alpha, volatility_factor]):
+            raise ValueError("Alpha and volatility factor must be numeric")
+        if alpha < 0 or volatility_factor < 0:
+            raise ValueError("Alpha and volatility factor must be non-negative")
+    
+    @staticmethod
+    def validate_inputs(best_bid: float, best_ask: float, bid_size: float, ask_size: float):
+        """Validate input parameters for micro-price calculation."""
+        if not all(isinstance(x, (int, float)) for x in [best_bid, best_ask, bid_size, ask_size]):
+            raise ValueError("All inputs must be numeric")
+        if best_bid < 0 or best_ask < 0:
+            raise ValueError("Best bid and ask prices must be non-negative")
+        if best_ask < best_bid:
+            raise ValueError("Best ask must be greater than or equal to best bid")
+        if bid_size < 0 or ask_size < 0:
+            raise ValueError("Bid and ask sizes must be non-negative")
+        if bid_size == 0 and ask_size == 0:
+            raise ValueError("At least one of bid_size or ask_size must be positive")
+    
+    def calculate(self, best_bid: float, best_ask: float, bid_size: float, ask_size: float) -> float:
+        """
+        Calculate micro-price using a stochastic Stoikov-inspired model with non-linear adjustment.
+        
+        Formula:
+            P_micro = M + S * tanh(α * (I - 0.5))
+        Where:
+            - M is mid-price: (best_bid + best_ask) / 2
+            - S is spread: best_ask - best_bid
+            - I is imbalance: bid_size / (bid_size + ask_size)
+            - α is sensitivity parameter, modulated by volatility_factor
+            - tanh introduces non-linearity, reflecting stochastic order flow dynamics
+        
+        Args:
+            best_bid (float): Best bid price in the order book.
+            best_ask (float): Best ask price in the order book.
+            bid_size (float): Size of the best bid.
+            ask_size (float): Size of the best ask.
+        
+        Returns:
+            float: Micro-price, constrained to lie within [best_bid, best_ask].
+        """
+        # Validate inputs
+        self.validate_inputs(best_bid, best_ask, bid_size, ask_size)
+        
+        # Calculate mid-price
+        mid_price = (best_bid + best_ask) / 2.0
+        
+        # Fallback to mid-price if sizes are invalid for imbalance calculation
+        if bid_size == 0 or ask_size == 0:
+            return mid_price
+        
+        # Calculate spread and imbalance
+        spread = best_ask - best_bid
+        imbalance = bid_size / (bid_size + ask_size)
+        
+        # Adjust alpha based on volatility (simplified proxy for order arrival intensity)
+        effective_alpha = self.alpha * self.volatility_factor
+        
+        # Stochastic non-linear adjustment using tanh
+        delta = imbalance - 0.5
+        adjustment = spread * math.tanh(effective_alpha * delta)
+        
+        # Calculate micro-price
+        micro_price = mid_price + adjustment
+        
+        # Ensure micro-price stays within bid-ask spread
+        micro_price = max(best_bid, min(best_ask, micro_price))
+        
+        return micro_price
 
 # ======================== HELPER FUNCTIONS ========================
 def api_request_with_retry(func, *args, max_retries=3, **kwargs):
     for attempt in range(max_retries):
         try:
             rate_limiter.wait()
-            return func(*args, **kwargs)
+            response = func(*args, **kwargs)
+            return response
         except Exception as e:
             if attempt == max_retries - 1:
+                logging.error(f"API request failed after {max_retries} retries: {str(e)}")
                 raise
             time.sleep(1 * (2 ** attempt))
     return None
@@ -165,17 +258,22 @@ def safe_float(value, default=0.0):
 def estimate_volume_from_orderbook(symbol):
     try:
         book_response = api_request_with_retry(info.l2_snapshot, symbol)
-        book = OrderBook(**book_response) if book_response else None
+        if not book_response or 'levels' not in book_response:
+            st.session_state.debug_info[f'volume_empty_{symbol}'] = 'Empty or invalid order book'
+            return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
         
-        if not book or len(book.levels) < 2:
-            return 0
-            
+        book = OrderBook(**book_response)
+        if len(book.levels) < 2:
+            st.session_state.debug_info[f'volume_sparse_{symbol}'] = 'Insufficient order book levels'
+            return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
+        
         bids = [level for level in book.levels if level.side == 'b']
         asks = [level for level in book.levels if level.side == 'a']
         
         if not bids or not asks:
-            return 0
-            
+            st.session_state.debug_info[f'volume_no_bids_asks_{symbol}'] = 'No bids or asks in order book'
+            return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
+        
         top_bids = sorted(bids, key=lambda x: -x.price)[:5]
         top_asks = sorted(asks, key=lambda x: x.price)[:5]
         
@@ -186,8 +284,9 @@ def estimate_volume_from_orderbook(symbol):
         ask_price = top_asks[0].price if top_asks else 0
         
         if bid_price <= 0 or ask_price <= 0 or bid_liquidity <= 0 or ask_liquidity <= 0:
-            return 0
-            
+            st.session_state.debug_info[f'volume_invalid_{symbol}'] = 'Invalid prices or liquidity'
+            return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
+        
         if bid_price > ask_price:
             bid_price, ask_price = ask_price, bid_price
         
@@ -199,20 +298,46 @@ def estimate_volume_from_orderbook(symbol):
         volume_multiplier = 20 if symbol in ["BTC", "ETH"] else 10
         volume = total_liquidity_value * volume_multiplier
         
-        return max(volume, 1000)
+        return max(volume, 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000)
     except Exception as e:
-        return 1000 if symbol in ["BTC", "ETH"] else 0
+        st.session_state.debug_info[f'volume_error_{symbol}'] = str(e)
+        logging.error(f"Volume estimation failed for {symbol}: {str(e)}")
+        return 10000 if symbol in ["BTC", "ETH", "SOL"] else 1000
 
 # ======================== DATA FETCHING ========================
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def fetch_all_markets():
     try:
-        debug_info = {}
+        logging.info("Starting market fetch")
+        debug_info = st.session_state.debug_info
+        
+        # Fetch market metadata
         meta_response = api_request_with_retry(info.meta)
+        if not meta_response or 'universe' not in meta_response:
+            debug_info['meta_error'] = 'Invalid or empty meta response'
+            st.error("Failed to fetch market metadata")
+            logging.error("Failed to fetch market metadata")
+            st.session_state.debug_info = debug_info
+            return pd.DataFrame()
+        
         meta = MarketUniverse(**meta_response)
         debug_info['total_markets'] = len(meta.universe)
+        if not meta.universe:
+            debug_info['meta_empty'] = 'No markets in universe'
+            st.warning("No markets found in metadata")
+            logging.warning("No markets found in metadata")
+            st.session_state.debug_info = debug_info
+            return pd.DataFrame()
         
+        # Fetch mid prices
         all_prices = api_request_with_retry(info.all_mids)
+        if not all_prices or not isinstance(all_prices, dict):
+            debug_info['mids_error'] = 'Invalid or empty mids response'
+            st.error("Failed to fetch mid prices")
+            logging.error("Failed to fetch mid prices")
+            st.session_state.debug_info = debug_info
+            return pd.DataFrame()
+        
         market_data = []
         skipped_markets = []
         
@@ -220,55 +345,68 @@ def fetch_all_markets():
         status = st.empty()
         
         for i, coin in enumerate(meta.universe):
-            symbol = coin['name']  # Access name using dictionary syntax
-            
+            symbol = coin['name']
             try:
                 progress.progress((i + 1) / len(meta.universe))
                 status.text(f"Processing {i+1}/{len(meta.universe)}: {symbol}")
                 
+                # Fetch mid price
                 price = safe_float(all_prices.get(symbol))
                 if not price:
                     skipped_markets.append({
                         'symbol': symbol,
-                        'reason': 'Could not get price data',
+                        'reason': 'No valid price data',
                         'min_required': MIN_LIQUIDITY
                     })
+                    debug_info[f'skip_no_price_{symbol}'] = 'Missing price'
                     continue
                 
+                # Estimate volume
                 volume_24h = estimate_volume_from_orderbook(symbol)
+                if volume_24h < MIN_LIQUIDITY:
+                    if symbol in ["BTC", "ETH", "SOL"]:
+                        volume_24h = max(volume_24h, MIN_LIQUIDITY * 1.1)
+                        debug_info[f'volume_fallback_{symbol}'] = f'Used fallback volume: {volume_24h}'
+                    else:
+                        skipped_markets.append({
+                            'symbol': symbol,
+                            'volume24h': volume_24h,
+                            'min_required': MIN_LIQUIDITY
+                        })
+                        debug_info[f'skip_low_volume_{symbol}'] = f'Volume {volume_24h} < {MIN_LIQUIDITY}'
+                        continue
                 
+                # Fetch funding rate
                 funding_rate = 0
                 try:
-                    funding_response = api_request_with_retry(info.funding_history, symbol, 1)
-                    if funding_response and len(funding_response) > 0:
+                    funding_response = api_request_with_retry(info.funding_history, symbol, limit=1)
+                    if funding_response and isinstance(funding_response, list) and len(funding_response) > 0:
                         funding_data = FundingRate(**funding_response[0])
                         funding_rate = safe_float(funding_data.fundingRate) * 10000 * 3 * 365
+                    else:
+                        debug_info[f'funding_empty_{symbol}'] = 'Empty or invalid funding response'
                 except Exception as e:
                     debug_info[f'funding_error_{symbol}'] = str(e)
+                    logging.error(f"Funding rate fetch failed for {symbol}: {str(e)}")
                 
-                if volume_24h < MIN_LIQUIDITY:
-                    skipped_markets.append({
-                        'symbol': symbol,
-                        'volume24h': volume_24h,
-                        'min_required': MIN_LIQUIDITY
-                    })
-                    continue
-                
+                # Calculate 24-hour price change
                 change_24h = 0
                 try:
                     end_time = int(datetime.now().timestamp() * 1000)
                     start_time = end_time - (24 * 60 * 60 * 1000)
-                    
                     candles_response = api_request_with_retry(info.candles_snapshot, symbol, '1h', start_time, end_time)
-                    if candles_response and len(candles_response) > 0:
+                    if candles_response and isinstance(candles_response, list) and len(candles_response) > 0:
                         candles = [CandleData(**candle) for candle in candles_response]
                         if len(candles) > 1:
                             oldest_price = safe_float(candles[0].open)
                             latest_price = safe_float(candles[-1].close)
                             if oldest_price > 0:
                                 change_24h = ((latest_price - oldest_price) / oldest_price) * 100
+                    else:
+                        debug_info[f'candles_empty_{symbol}'] = 'Empty or invalid candles response'
                 except Exception as e:
-                    debug_info[f'change_error_{symbol}'] = str(e)
+                    debug_info[f'candles_error_{symbol}'] = str(e)
+                    logging.error(f"Candles fetch failed for {symbol}: {str(e)}")
                 
                 market_data.append(MarketInfo(
                     name=symbol,
@@ -281,6 +419,7 @@ def fetch_all_markets():
                 
             except Exception as e:
                 debug_info[f'error_{symbol}'] = str(e)
+                logging.error(f"Processing failed for {symbol}: {str(e)}")
                 continue
         
         progress.empty()
@@ -292,7 +431,7 @@ def fetch_all_markets():
             debug_info['empty_result'] = True
             debug_info['min_liquidity'] = MIN_LIQUIDITY
             st.warning(f"No markets met the minimum liquidity threshold of ${MIN_LIQUIDITY:,}.")
-            
+            logging.warning(f"No markets met liquidity threshold of ${MIN_LIQUIDITY:,}")
             if st.session_state.get('force_include_major', False):
                 st.info("Using fallback data for major coins.")
                 fallback_data = [
@@ -300,16 +439,20 @@ def fetch_all_markets():
                     MarketInfo(name='ETH', markPrice=3000, lastPrice=3000, fundingRate=10, volume24h=300000, change24h=0.8),
                     MarketInfo(name='SOL', markPrice=150, lastPrice=150, fundingRate=15, volume24h=100000, change24h=2.5)
                 ]
-                return pd.DataFrame([m.dict() for m in fallback_data])
+                df = pd.DataFrame([m.dict() for m in fallback_data])
         
         debug_info['markets_processed'] = len(market_data)
         debug_info['markets_skipped'] = len(skipped_markets)
+        debug_info['skipped_samples'] = skipped_markets[:5]
         st.session_state.debug_info = debug_info
         
         return df.sort_values('volume24h', ascending=False) if not df.empty else pd.DataFrame()
-        
+    
     except Exception as e:
-        st.error(f"Error fetching markets: {str(e)}")
+        debug_info['critical_error'] = str(e)
+        st.session_state.debug_info = debug_info
+        st.error(f"Critical error fetching markets: {str(e)}")
+        logging.error(f"Critical error fetching markets: {str(e)}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
@@ -330,14 +473,18 @@ def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
         ohlcv = api_request_with_retry(info.candles_snapshot, symbol, timeframe, start_time, end_time)
         
         if not ohlcv or len(ohlcv) == 0:
+            st.session_state.debug_info[f'candles_empty_{symbol}'] = 'No candle data returned'
+            logging.warning(f"No candle data for {symbol}")
             return None
-            
+        
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'time_close', 'symbol', 'interval', 'open', 'close', 'high', 'low', 'volume', 'num'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
         return df
     except Exception as e:
+        st.session_state.debug_info[f'candles_error_{symbol}'] = str(e)
         st.error(f"Error fetching candles for {symbol}: {str(e)}")
+        logging.error(f"Error fetching candles for {symbol}: {str(e)}")
         return None
 
 # ======================== DATABASE FUNCTIONS ========================
@@ -409,7 +556,7 @@ class ForwardTester:
         self.active_trades: Dict[str, Trade] = {}
         self.completed_trades: List[Trade] = []
         self.load_state()
-        
+    
     def load_state(self):
         try:
             active_trades, completed_trades = load_state_from_db()
@@ -417,6 +564,7 @@ class ForwardTester:
             self.completed_trades = [Trade(**t) for t in completed_trades]
         except Exception as e:
             st.warning(f"Could not load previous state: {str(e)}. Starting fresh.")
+            logging.error(f"Could not load state: {str(e)}")
     
     def save_state(self):
         try:
@@ -426,15 +574,14 @@ class ForwardTester:
             )
         except Exception as e:
             st.error(f"Error saving state to database: {str(e)}")
+            logging.error(f"Error saving state: {str(e)}")
     
     def execute_trades(self, signals: List[Signal]):
         executed = []
         for signal in signals:
             symbol = signal.Symbol
-            
             if symbol in self.active_trades:
                 continue
-                
             if signal.Signal != "HOLD":
                 self.active_trades[symbol] = Trade(
                     Symbol=symbol,
@@ -448,26 +595,21 @@ class ForwardTester:
                     status='OPEN'
                 )
                 executed.append(f"📝 New {signal.Signal} trade for {symbol} at {signal.Price}")
-        
         self.save_state()
         return executed
     
     def update_trades(self):
         to_remove = []
         updates = []
-        
         markets_df = fetch_all_markets()
         if not markets_df.empty:
             prices_dict = {row['symbol']: row['markPrice'] for _, row in markets_df.iterrows()}
-            
             for symbol, trade in self.active_trades.items():
                 try:
                     current_price = prices_dict.get(symbol)
                     if not current_price:
                         continue
-                        
                     entry_price = trade.entry_price
-                    
                     if trade.direction == "LONG":
                         if trade.tp_price and current_price >= trade.tp_price:
                             trade.exit_reason = "TP Hit"
@@ -478,7 +620,6 @@ class ForwardTester:
                             trade.exit_reason = "TP Hit"
                         elif trade.sl_price and current_price >= trade.sl_price:
                             trade.exit_reason = "SL Hit"
-                    
                     if hasattr(trade, 'exit_reason'):
                         trade.exit_price = current_price
                         trade.exit_time = datetime.now().isoformat()
@@ -487,21 +628,17 @@ class ForwardTester:
                         self.completed_trades.append(trade)
                         to_remove.append(symbol)
                         updates.append(f"✅ Trade closed: {symbol} | Reason: {trade.exit_reason} | PnL: {trade.pct_change:.2f}%")
-                
                 except Exception as e:
                     updates.append(f"Error updating {symbol}: {str(e)}")
-            
+                    logging.error(f"Error updating trade {symbol}: {str(e)}")
             for symbol in to_remove:
                 self.active_trades.pop(symbol)
-            
-            self.save_state()
-        
+        self.save_state()
         return updates
     
     def get_performance_report(self):
         if not self.completed_trades:
             return "No completed trades yet", pd.DataFrame()
-            
         df = pd.DataFrame([t.dict() for t in self.completed_trades])
         df['entry_time'] = pd.to_datetime(df['entry_time'])
         if 'exit_time' in df.columns:
@@ -509,16 +646,14 @@ class ForwardTester:
             df['duration'] = (df['exit_time'] - df['entry_time']).dt.total_seconds()/3600
         else:
             df['duration'] = 0
-        
         stats = {
             'total_trades': len(df),
             'win_rate': len(df[df['pct_change'] > 0])/len(df) if len(df) > 0 else 0,
             'avg_pnl': df['pct_change'].mean() if 'pct_change' in df.columns else 0,
             'avg_duration_hours': df['duration'].mean() if 'duration' in df.columns else 0
         }
-        
         return stats, df
-
+    
     def reset_all_trades(self):
         self.active_trades = {}
         self.completed_trades = []
@@ -528,76 +663,129 @@ class ForwardTester:
 # ======================== SIGNAL GENERATION ========================
 def generate_signals(markets_df):
     if markets_df is None or markets_df.empty:
+        st.warning("No market data available for signal generation")
+        st.session_state.debug_info['signals_error'] = 'Empty markets DataFrame'
+        logging.warning("No market data for signal generation")
         return []
     
     signals = []
     top_markets = markets_df.head(15)
     total_markets = len(top_markets)
     
+    # Initialize MicroPrice calculator with dynamic volatility adjustment
+    micro_price_calc = MicroPrice(alpha=2.0, volatility_factor=1.0)
+    
     progress_bar = st.progress(0)
     status_text = st.empty()
+    
+    # Micro-price threshold as percentage of price
+    MICRO_PRICE_THRESHOLD = 0.001  # 0.1% threshold for signal generation
     
     for i, (index, market) in enumerate(top_markets.iterrows()):
         symbol = market['symbol']
         status_text.text(f"Analyzing {symbol}... ({i+1}/{total_markets})")
-        df = fetch_hyperliquid_candles(symbol, interval='1h', limit=48)
-        if df is None or len(df) < 6:
-            continue
+        
+        # Get order book data for micro-price calculation
+        try:
+            book_response = api_request_with_retry(info.l2_snapshot, symbol)
+            if not book_response or 'levels' not in book_response:
+                continue
             
-        # Calculate volume metrics with consistency check
-        recent_vols = df['volume'].tail(3)  # Last 3 hours
-        avg_vol = df['volume'].mean()
-        recent_vol = recent_vols.mean()  # Average of last 3 hours
-        vol_surge = recent_vol / avg_vol if avg_vol > 0 else 0
-        
-        # Calculate volatility for dynamic TP/SL
-        df['hlrange'] = df['high'] - df['low']
-        avg_range = df['hlrange'].mean()
-        volatility_factor = min(max(avg_range / df['close'].iloc[-1], 0.01), 0.05)
-        
-        signal = "HOLD"
-        reason = ""
-        tp = "-"
-        sl = "-"
-        
-        funding_rate = market['fundingRate']
-        
-        if vol_surge >= VOL_MULTIPLIER and recent_vol > BASE_VOL * avg_vol:
-            recent_change = (df['close'].iloc[-1] - df['open'].iloc[-1]) / df['open'].iloc[-1]
-              # Check if recent volume is consistently high
+            book = OrderBook(**book_response)
+            bids = [level for level in book.levels if level.side == 'b']
+            asks = [level for level in book.levels if level.side == 'a']
+            
+            if not bids or not asks:
+                continue
+            
+            best_bid = bids[0].price
+            best_ask = asks[0].price
+            bid_size = bids[0].size
+            ask_size = asks[0].size
+            
+            # Calculate micro-price
+            micro_price = micro_price_calc.calculate(best_bid, best_ask, bid_size, ask_size)
+            mid_price = (best_bid + best_ask) / 2
+            spread = best_ask - best_bid
+            spread_bps = (spread / mid_price) * 10000  # Convert to basis points
+            
+            # Get historical candle data
+            df = fetch_hyperliquid_candles(symbol, interval='1h', limit=48)
+            if df is None or len(df) < 6:
+                st.session_state.debug_info[f'no_candles_{symbol}'] = 'Insufficient candle data'
+                logging.warning(f"Insufficient candle data for {symbol}")
+                continue
+            
+            # Volume analysis
+            recent_vols = df['volume'].tail(3)
+            avg_vol = df['volume'].mean()
+            recent_vol = recent_vols.mean()
+            vol_surge = recent_vol / avg_vol if avg_vol > 0 else 0
             vol_consistent = all(v > avg_vol * VOL_MULTIPLIER * 0.7 for v in recent_vols)
             
-            # Calculate dynamic TP/SL based on volatility
-            tp_distance = max(volatility_factor * 5, 0.02)  # Min 2% TP
-            sl_distance = max(volatility_factor * 3, 0.015)  # Min 1.5% SL
+            # Volatility calculation for dynamic TP/SL
+            df['hlrange'] = df['high'] - df['low']
+            avg_range = df['hlrange'].mean()
+            volatility_factor = min(max(avg_range / df['close'].iloc[-1], 0.01), 0.05)
             
-            if recent_change > 0.01 and funding_rate < -FUNDING_THRESHOLD and vol_consistent:
-                signal = "LONG"
-                reason = f"Vol surge {vol_surge:.2f}x with bullish price action and favorable funding rate ({funding_rate:.2f} bps)"
-                tp = str(round(df['close'].iloc[-1] * (1 + tp_distance), 4))
-                sl = str(round(df['close'].iloc[-1] * (1 - sl_distance), 4))
-            elif recent_change < -0.01 and funding_rate > FUNDING_THRESHOLD and vol_consistent:
-                signal = "SHORT"
-                reason = f"Vol surge {vol_surge:.2f}x with bearish price action and favorable funding rate ({funding_rate:.2f} bps)"
-                tp = str(round(df['close'].iloc[-1] * (1 - tp_distance), 4))
-                sl = str(round(df['close'].iloc[-1] * (1 + sl_distance), 4))
+            signal = "HOLD"
+            reason = ""
+            tp = "-"
+            sl = "-"
+            
+            funding_rate = market['fundingRate']
+            current_price = df['close'].iloc[-1]
+            
+            # Combined signal logic using micro-price, volume, spread, and funding rate
+            micro_price_deviation = (micro_price - mid_price) / mid_price
+            
+            # Calculate dynamic thresholds based on volatility
+            price_threshold = max(MICRO_PRICE_THRESHOLD, volatility_factor * 0.5)
+            max_spread_bps = 50  # Maximum acceptable spread in basis points
+            
+            # Dynamic TP/SL distances based on volatility and spread
+            tp_distance = max(volatility_factor * 5, 0.02)  # Minimum 2% TP
+            sl_distance = max(volatility_factor * 3, 0.015)  # Minimum 1.5% SL
+            
+            # Signal generation combining all factors
+            if spread_bps <= max_spread_bps and vol_surge >= VOL_MULTIPLIER and vol_consistent:
+                if micro_price_deviation > price_threshold and funding_rate < -FUNDING_THRESHOLD:
+                    signal = "LONG"
+                    reason = f"Micro-price above mid: {micro_price_deviation:.4f}, Vol surge {vol_surge:.2f}x, Funding {funding_rate:.2f} bps"
+                    tp = str(round(current_price * (1 + tp_distance), 4))
+                    sl = str(round(current_price * (1 - sl_distance), 4))
+                
+                elif micro_price_deviation < -price_threshold and funding_rate > FUNDING_THRESHOLD:
+                    signal = "SHORT"
+                    reason = f"Micro-price below mid: {micro_price_deviation:.4f}, Vol surge {vol_surge:.2f}x, Funding {funding_rate:.2f} bps"
+                    tp = str(round(current_price * (1 - tp_distance), 4))
+                    sl = str(round(current_price * (1 + sl_distance), 4))
+            
+            # Add signal to results
+            signals.append(Signal(
+                Symbol=symbol,
+                Price=current_price,
+                MarkPrice=market['markPrice'],
+                Signal=signal,
+                Volume24h=market['volume24h'],
+                FundingRate=funding_rate,
+                VolSurge=vol_surge,
+                Change24h=market['change24h'],
+                Reason=reason,
+                TP=tp,
+                SL=sl
+            ))
         
-        signals.append(Signal(
-            Symbol=symbol,
-            Price=df['close'].iloc[-1],
-            MarkPrice=market['markPrice'],
-            Signal=signal,
-            Volume24h=market['volume24h'],
-            FundingRate=funding_rate,
-            VolSurge=vol_surge,
-            Change24h=market['change24h'],
-            Reason=reason,
-            TP=tp,
-            SL=sl
-        ))
+        except Exception as e:
+            logging.error(f"Error analyzing {symbol}: {str(e)}")
+            continue
+        
+        progress_bar.progress((i + 1) / total_markets)
     
     progress_bar.empty()
     status_text.empty()
+    st.session_state.debug_info['signals_generated'] = len(signals)
+    logging.info(f"Generated {len(signals)} signals")
     return signals
 
 def scan_markets():
@@ -607,19 +795,19 @@ def scan_markets():
     try:
         with st.spinner("Fetching market data from Hyperliquid..."):
             markets_df = fetch_all_markets()
-            
             if markets_df.empty:
-                if 'debug_info' in st.session_state:
-                    debug = st.session_state.debug_info
-                    if 'skipped_samples' in debug and debug['skipped_samples']:
-                        st.warning(f"Found data but all markets were below the liquidity threshold.")
+                debug = st.session_state.debug_info
+                if 'skipped_samples' in debug and debug['skipped_samples']:
+                    st.warning(f"All markets were below the liquidity threshold of ${MIN_LIQUIDITY:,}.")
+                else:
+                    st.warning("No market data fetched. Check debug info.")
+                logging.warning("No markets fetched")
                 return
-                
             st.session_state.scanned_markets = markets_df
             st.success(f"Found {len(markets_df)} markets meeting the minimum liquidity threshold of ${MIN_LIQUIDITY:,} USD.")
-    
     except Exception as e:
         st.error(f"Error during market scan: {str(e)}")
+        logging.error(f"Market scan error: {str(e)}")
         return
     
     try:
@@ -627,7 +815,6 @@ def scan_markets():
             with st.spinner("Analyzing markets for trading signals..."):
                 signals = generate_signals(markets_df)
                 st.session_state.signals = signals
-                
                 actionable_count = len([s for s in signals if s.Signal != 'HOLD'])
                 if actionable_count > 0:
                     st.success(f"Analysis complete. Found {actionable_count} actionable signals.")
@@ -635,12 +822,12 @@ def scan_markets():
                     st.info("Analysis complete. No actionable signals found with current parameters.")
     except Exception as e:
         st.error(f"Error during signal generation: {str(e)}")
+        logging.error(f"Signal generation error: {str(e)}")
+        return
 
 # ======================== STREAMLIT UI ========================
-# Initialize the forward tester
 tester = ForwardTester()
 
-# Sidebar for parameters
 with st.sidebar:
     st.header("Parameters")
     BASE_VOL = st.slider("Base Volume Threshold", 0.1, 2.0, 0.35, 0.05)
@@ -659,51 +846,46 @@ with st.sidebar:
     selected_liquidity = st.selectbox(
         "Minimum Liquidity",
         options=list(liquidity_options.keys()),
-        index=1
+        index=0  # Default to 5,000 USD
     )
     
     MIN_LIQUIDITY = liquidity_options[selected_liquidity]
+    st.session_state.MIN_LIQUIDITY = MIN_LIQUIDITY
     
     with st.expander("Advanced Settings"):
         st.session_state.use_orderbook_fallback = st.checkbox(
-            "Use orderbook fallback", 
-            value=True, 
+            "Use orderbook fallback",
+            value=True,
             help="Estimate volume from orderbook when API volume data is missing"
         )
-        
         fallback_threshold = st.number_input(
             "Fallback threshold (USD)",
             value=5000.0,
             min_value=1000.0,
             step=1000.0
         )
-        
         api_calls_per_second = st.slider(
             "API calls per second",
             min_value=1,
             max_value=10,
-            value=3
+            value=2
         )
         rate_limiter.calls_per_second = api_calls_per_second
-    
-    FUNDING_THRESHOLD = st.slider("Funding Rate Threshold (basis points)", 10, 200, 60, 5)
+        FUNDING_THRESHOLD = st.slider("Funding Rate Threshold (basis points)", 10, 200, 60, 5)
     
     with st.expander("Debugging Tools"):
         if 'debug_mode' not in st.session_state:
             st.session_state.debug_mode = False
-        
         debug_enabled = st.checkbox(
             "Enable Debug Mode",
             value=st.session_state.debug_mode,
             key="debug_mode_toggle",
             on_change=lambda: st.session_state.update(debug_mode=not st.session_state.debug_mode)
         )
-        
         if st.session_state.debug_mode:
             st.warning("Debug Mode is ON - This may slow down the application")
             st.session_state.log_api_responses = st.checkbox("Log API Responses", value=True)
             st.session_state.force_include_major = st.checkbox("Force Include Major Coins", value=True)
-            
             debug_min_liquidity = st.number_input(
                 "Debug Min Liquidity",
                 min_value=1000,
@@ -711,21 +893,16 @@ with st.sidebar:
                 value=5000,
                 step=1000
             )
-            
             if st.button("Apply Debug Settings"):
                 st.session_state.MIN_LIQUIDITY = debug_min_liquidity
                 st.success(f"Applied debug settings. Min liquidity now: ${st.session_state.MIN_LIQUIDITY:,}")
 
-# Create tabs for different sections
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Market Scanner", "Active Trades", "Completed Trades", "Performance", "Database", "Debug"])
 
-# Tab 1: Market Scanner
 with tab1:
     st.info(f"Current Minimum Liquidity: ${MIN_LIQUIDITY:,} USD")
-    
     if st.button("Scan Markets", use_container_width=True):
         scan_markets()
-    
     if not st.session_state.scanned_markets.empty:
         st.subheader("All Markets")
         st.dataframe(
@@ -739,18 +916,12 @@ with tab1:
                 'change24h': st.column_config.NumberColumn("24h Change", format="%.2f%%")
             }
         )
-    
     if st.session_state.signals:
         st.subheader("Trading Signals")
         signals_df = pd.DataFrame([s.dict() for s in st.session_state.signals])
-        
-        signal_filter = st.multiselect("Filter by Signal", 
-                                     options=['LONG', 'SHORT', 'HOLD'], 
-                                     default=['LONG', 'SHORT'])
-        
+        signal_filter = st.multiselect("Filter by Signal", options=['LONG', 'SHORT', 'HOLD'], default=['LONG', 'SHORT'])
         if signal_filter:
             filtered_df = signals_df[signals_df['Signal'].isin(signal_filter)]
-            
             st.dataframe(
                 filtered_df,
                 use_container_width=True,
@@ -761,54 +932,41 @@ with tab1:
                     'VolSurge': st.column_config.NumberColumn("Volume Surge", format="%.2fx")
                 }
             )
-            
             actionable_signals = [s for s in st.session_state.signals if s.Signal != "HOLD" and s.Signal in signal_filter]
             if actionable_signals and st.button("Execute Selected Signals"):
                 results = tester.execute_trades(actionable_signals)
                 for result in results:
                     st.success(result)
 
-# Tab 2: Active Trades
 with tab2:
     st.header("Active Trades")
-    
     if st.button("Update Trades"):
         updates = tester.update_trades()
         for update in updates:
             st.info(update)
-    
     if tester.active_trades:
         active_df = pd.DataFrame([t.dict() for t in tester.active_trades.values()])
-        
         markets_df = fetch_all_markets()
         prices_dict = {row['symbol']: row['markPrice'] for _, row in markets_df.iterrows()} if not markets_df.empty else {}
-        
         for idx, row in active_df.iterrows():
             try:
                 current_price = prices_dict.get(row['Symbol'], 0)
                 entry_price = row['entry_price']
-                
                 active_df.at[idx, 'current_price'] = current_price
-                
                 if row['direction'] == "LONG":
                     pnl = ((current_price - entry_price) / entry_price) * 100
                 else:
                     pnl = ((entry_price - current_price) / entry_price) * 100
-                    
                 active_df.at[idx, 'unrealized_pnl'] = pnl
             except Exception:
                 active_df.at[idx, 'current_price'] = "Error"
                 active_df.at[idx, 'unrealized_pnl'] = 0
-        
         st.dataframe(active_df, use_container_width=True)
-        
         st.subheader("Individual Trade Charts")
         selected_trade = st.selectbox("Select a trade to view", list(tester.active_trades.keys()))
-        
         if selected_trade:
             timeframe = st.selectbox("Timeframe", ['1h', '4h', '1d'], index=0)
             ohlcv_df = fetch_hyperliquid_candles(selected_trade, interval=timeframe, limit=50)
-            
             if ohlcv_df is not None:
                 fig = go.Figure(data=[go.Candlestick(
                     x=ohlcv_df['timestamp'],
@@ -818,35 +976,24 @@ with tab2:
                     close=ohlcv_df['close'],
                     name="OHLC"
                 )])
-                
                 trade_data = tester.active_trades[selected_trade]
-                
-                fig.add_hline(y=trade_data.entry_price, line_width=1, line_dash="dash", 
-                              line_color="yellow", annotation_text="Entry")
-                
+                fig.add_hline(y=trade_data.entry_price, line_width=1, line_dash="dash", line_color="yellow", annotation_text="Entry")
                 if trade_data.tp_price:
-                    fig.add_hline(y=trade_data.tp_price, line_width=1, line_dash="dash", 
-                                 line_color="green", annotation_text="TP")
-                    
+                    fig.add_hline(y=trade_data.tp_price, line_width=1, line_dash="dash", line_color="green", annotation_text="TP")
                 if trade_data.sl_price:
-                    fig.add_hline(y=trade_data.sl_price, line_width=1, line_dash="dash", 
-                                 line_color="red", annotation_text="SL")
-                
+                    fig.add_hline(y=trade_data.sl_price, line_width=1, line_dash="dash", line_color="red", annotation_text="SL")
                 fig.update_layout(
                     title=f"{selected_trade} - {timeframe} Chart",
                     xaxis_title="Date",
                     yaxis_title="Price",
                     height=600
                 )
-                
                 st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No active trades at the moment.")
 
-# Tab 3: Completed Trades
 with tab3:
     st.header("Completed Trades")
-    
     col1, col2 = st.columns([1,3])
     with col1:
         if st.button("Reset All Trades"):
@@ -854,12 +1001,9 @@ with tab3:
                 if st.checkbox("I confirm I want to reset all trades"):
                     result = tester.reset_all_trades()
                     st.success(result)
-    
     stats, completed_df = tester.get_performance_report()
-    
     if isinstance(completed_df, pd.DataFrame) and len(completed_df) > 0:
         st.dataframe(completed_df, use_container_width=True)
-        
         if 'pct_change' in completed_df.columns:
             fig = px.pie(
                 names=['Winning Trades', 'Losing Trades'],
@@ -874,47 +1018,38 @@ with tab3:
     else:
         st.info("No completed trades yet.")
 
-# Tab 4: Performance
 with tab4:
     st.header("Trading Performance")
-    
     stats, completed_df = tester.get_performance_report()
-    
     if isinstance(stats, dict):
         stats_df = pd.DataFrame([stats])
         st.dataframe(stats_df, use_container_width=True)
-        
         if isinstance(completed_df, pd.DataFrame) and len(completed_df) > 0 and 'pct_change' in completed_df.columns:
             if 'exit_time' in completed_df.columns:
                 completed_df_sorted = completed_df.sort_values('exit_time')
                 completed_df_sorted['cumulative_pnl'] = completed_df_sorted['pct_change'].cumsum()
-                
                 fig = px.line(
                     completed_df_sorted,
-                    x='exit_time', 
+                    x='exit_time',
                     y='cumulative_pnl',
                     title="Cumulative P&L (%)",
                     labels={'exit_time': 'Date', 'cumulative_pnl': 'Cumulative P&L (%)'}
                 )
                 st.plotly_chart(fig, use_container_width=True)
-            
-            fig = px.histogram(
-                completed_df,
-                x='pct_change',
-                nbins=20,
-                title="P&L Distribution",
-                labels={'pct_change': 'P&L (%)'}
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                fig = px.histogram(
+                    completed_df,
+                    x='pct_change',
+                    nbins=20,
+                    title="P&L Distribution",
+                    labels={'pct_change': 'P&L (%)'}
+                )
+                st.plotly_chart(fig, use_container_width=True)
     else:
         st.info(stats)
 
-# Tab 5: Database Management
 with tab5:
     st.header("Database Management")
-    
     col1, col2 = st.columns(2)
-    
     with col1:
         st.subheader("Database Information")
         if os.path.exists('trading_state.db'):
@@ -925,14 +1060,12 @@ with tab5:
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = cursor.fetchall()
             conn.close()
-            
             st.write(f"Database Size: {db_size/1024:.2f} KB")
             st.write("Tables:")
             for table in tables:
                 st.write(f"- {table[0]}")
         else:
             st.write("Database file not found.")
-    
     with col2:
         st.subheader("Database Actions")
         if st.button("Backup Database"):
@@ -943,7 +1076,7 @@ with tab5:
                 st.success(f"Database backed up to {backup_file}")
             except Exception as e:
                 st.error(f"Backup failed: {str(e)}")
-        
+                logging.error(f"Database backup failed: {str(e)}")
         if st.button("Clear Cache"):
             try:
                 if os.path.exists('market_cache.db'):
@@ -957,35 +1090,29 @@ with tab5:
                     st.success("Cache cleared successfully")
             except Exception as e:
                 st.error(f"Failed to clear cache: {str(e)}")
+                logging.error(f"Cache clear failed: {str(e)}")
 
-# Tab 6: Debug Information
 with tab6:
     st.header("Debug Information")
-    
     debug_enabled = st.checkbox(
         "Enable Debug Mode",
         value=st.session_state.get('debug_mode', False),
         key="debug_tab_toggle",
         on_change=lambda: st.session_state.update(debug_mode=not st.session_state.debug_mode)
     )
-    
     if debug_enabled != st.session_state.get('debug_mode_prev', None):
         st.session_state.debug_mode_prev = debug_enabled
         st.success(f"Debug mode {'enabled' if debug_enabled else 'disabled'}")
-    
     if st.button("Test Hyperliquid Connection"):
         try:
             meta = info.meta()
             st.success("✅ Hyperliquid connection established")
             st.write(f"Total markets: {len(meta['universe'])}")
-            
             if len(meta['universe']) > 0:
                 sample_symbol = meta['universe'][0]['name']
                 st.write(f"Sample market: {sample_symbol}")
-                
                 ticker = info.all_mids()
                 st.write(f"Current mid price: {ticker.get(sample_symbol, 'N/A')}")
-                
                 try:
                     book = info.l2_snapshot(sample_symbol)
                     if book and 'levels' in book and book['levels']:
@@ -1001,44 +1128,30 @@ with tab6:
                         st.error(f"❌ Failed to fetch valid orderbook for {sample_symbol}")
                 except Exception as e:
                     st.error(f"❌ Orderbook test failed: {str(e)}")
+                    logging.error(f"Orderbook test failed for {sample_symbol}: {str(e)}")
         except Exception as e:
             st.error(f"❌ Hyperliquid connection test failed: {str(e)}")
+            logging.error(f"Hyperliquid connection test failed: {str(e)}")
     
     if st.session_state.debug_info:
         st.subheader("Last Scan Debug Info")
-        
         cols = st.columns(3)
         with cols[0]:
-            st.metric("Total Markets", 
-                      st.session_state.debug_info.get('total_markets', 'N/A'))
+            st.metric("Total Markets", st.session_state.debug_info.get('total_markets', 'N/A'))
         with cols[1]:
-            st.metric("Markets Processed", 
-                      st.session_state.debug_info.get('markets_processed', 'N/A'))
+            st.metric("Markets Processed", st.session_state.debug_info.get('markets_processed', 'N/A'))
         with cols[2]:
-            st.metric("Markets Skipped", 
-                      st.session_state.debug_info.get('markets_skipped', 'N/A'))
-        
-        if 'BTC_details' in st.session_state.debug_info:
-            st.subheader("BTC Market Details")
-            st.json(st.session_state.debug_info['BTC_details'])
-            
-            if 'BTC_raw_book' in st.session_state.debug_info:
-                with st.expander("Raw BTC Orderbook Data"):
-                    st.code(st.session_state.debug_info['BTC_raw_book'])
+            st.metric("Markets Skipped", st.session_state.debug_info.get('markets_skipped', 'N/A'))
         
         if 'skipped_samples' in st.session_state.debug_info and st.session_state.debug_info['skipped_samples']:
             st.subheader("Sample Skipped Markets")
             st.json(st.session_state.debug_info['skipped_samples'])
-            
+        
         errors = {k: v for k, v in st.session_state.debug_info.items() if 'error' in k.lower()}
         if errors:
             with st.expander("Error Details"):
                 for k, v in errors.items():
                     st.error(f"{k}: {v}")
-        
-        if 'sample_price_response' in st.session_state.debug_info:
-            with st.expander("Sample API Response"):
-                st.code(st.session_state.debug_info['sample_price_response'])
     
     st.subheader("Cache Status")
     if os.path.exists('market_cache.db'):
@@ -1049,10 +1162,8 @@ with tab6:
         cursor.execute("SELECT COUNT(*) FROM ohlcv_cache")
         ohlcv_cache_count = cursor.fetchone()[0]
         conn.close()
-        
         st.write(f"Markets in cache: {market_cache_count}")
         st.write(f"OHLCV data sets in cache: {ohlcv_cache_count}")
-        
         if st.button("Clear All Cache"):
             try:
                 conn = sqlite3.connect('market_cache.db')
@@ -1066,17 +1177,16 @@ with tab6:
                 st.info("Please scan markets again to refresh data")
             except Exception as e:
                 st.error(f"❌ Failed to clear cache: {str(e)}")
+                logging.error(f"Clear cache failed: {str(e)}")
     else:
         st.write("Cache database not found.")
-        
+    
     st.subheader("Rate Limiter Settings")
     current_rate = st.session_state.get('api_rate', rate_limiter.calls_per_second)
     new_rate = st.slider("API calls per second", 1, 10, int(current_rate), 1)
-    
     if new_rate != current_rate:
         rate_limiter.calls_per_second = new_rate
         st.session_state.api_rate = new_rate
         st.success(f"Rate limiter updated to {new_rate} calls per second")
-        
-# Update timestamp in the footer
-st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
