@@ -31,12 +31,12 @@ st.set_page_config(
     page_title="Hyperliquid Futures Screener",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed"  # Collapsed sidebar for mobile
+    initial_sidebar_state="collapsed"
 )
 
-# Title and description
-st.title("📈 Hyperliquid Futures Screener")
-st.markdown("Track and analyze cryptocurrency futures markets on Hyperliquid")
+# Title and description (use st.write instead of st.markdown to avoid regex issues)
+st.title("Hyperliquid Futures Screener")
+st.write("Track and analyze cryptocurrency futures markets on Hyperliquid")
 
 # Initialize session state
 def init_session_state():
@@ -131,7 +131,7 @@ class Trade(BaseModel):
 
 # Rate Limiter
 class RateLimiter:
-    def __init__(self, calls_per_second=2):  # Reduced for mobile compatibility
+    def __init__(self, calls_per_second=2):
         self.calls_per_second = calls_per_second
         self.min_interval = 1.0 / calls_per_second
         self.last_call_time = 0
@@ -160,9 +160,8 @@ class VolumeFetcher:
             candles = self._fetch_candles_snapshot(symbol, "1h", start_time, end_time)
             if candles and isinstance(candles, list) and len(candles) > 0:
                 total_volume = sum(safe_float(candle.get("v", 0)) for candle in candles)
-                logging.info(f"Volume from candles for {symbol}: ${total_volume:.2f}")
+                logging.info(f"Volume for {symbol}: ${total_volume:.2f}")
                 return max(total_volume, 10000)
-            logging.warning(f"Candlestick data unavailable for {symbol}, falling back to order book")
             return self._estimate_volume_from_orderbook(symbol)
         except Exception as e:
             logging.error(f"Failed to get volume for {symbol}: {str(e)}")
@@ -172,7 +171,6 @@ class VolumeFetcher:
         self.rate_limiter.wait()
         base_symbol = name.split('/')[0] if '/' in name else name
         symbol_formats = [base_symbol, f"{base_symbol}/USDC:USDC"]
-        errors = []
         for sym_format in symbol_formats:
             try:
                 req = {
@@ -184,11 +182,8 @@ class VolumeFetcher:
                 response = self.info.post("/info", {"type": "candleSnapshot", "req": req})
                 if response and isinstance(response, list) and len(response) > 0:
                     return response
-                else:
-                    errors.append(f"Empty or invalid response for format {sym_format}")
             except Exception as e:
-                errors.append(f"Error with format {sym_format}: {str(e)}")
-        logging.warning(f"Failed to get candles for {name}. Errors: {errors}")
+                logging.warning(f"Candles fetch failed for {sym_format}: {str(e)}")
         return None
 
     def _estimate_volume_from_orderbook(self, symbol: str) -> float:
@@ -196,21 +191,18 @@ class VolumeFetcher:
         try:
             book_response = self.info.l2_snapshot(symbol)
             if not book_response or "levels" not in book_response:
-                logging.warning(f"Invalid order book for {symbol}")
                 return 10000
             parsed_levels = self._parse_orderbook_levels(book_response["levels"])
             bids = [level for level in parsed_levels if level["side"] == "b"]
             asks = [level for level in parsed_levels if level["side"] == "a"]
             if not bids or not asks:
-                logging.warning(f"No bids or asks in order book for {symbol}")
                 return 10000
-            top_bids = sorted(bids, key=lambda x: -x["price"])[:10]  # Reduced for performance
-            top_asks = sorted(asks, key=lambda x: x["price"])[:10]
+            top_bids = sorted(bids, key=lambda x: -x["price"])[:5]
+            top_asks = sorted(asks, key=lambda x: x["price"])[:5]
             bid_liquidity = sum(level["size"] for level in top_bids)
             ask_liquidity = sum(level["size"] for level in top_asks)
             mid_price = (top_bids[0]["price"] + top_asks[0]["price"]) / 2
             estimated_volume = (bid_liquidity + ask_liquidity) * mid_price
-            logging.info(f"Estimated volume for {symbol}: ${estimated_volume:.2f}")
             return max(estimated_volume, 10000)
         except Exception as e:
             logging.error(f"Order book estimation failed for {symbol}: {str(e)}")
@@ -243,7 +235,7 @@ class MicroPrice:
             if best_ask < best_bid:
                 best_bid, best_ask = best_ask, best_bid
             if bid_size == 0 and ask_size == 0:
-                raise ValueError("At least one of bid_size or ask_size must be positive")
+                return (best_bid + best_ask) / 2.0
             mid_price = (best_bid + best_ask) / 2.0
             if bid_size == 0 or ask_size == 0:
                 return mid_price
@@ -255,14 +247,14 @@ class MicroPrice:
             micro_price = mid_price + adjustment
             return max(best_bid, min(best_ask, micro_price))
         except Exception as e:
-            logging.error(f"MicroPrice calculation error: {str(e)}")
+            logging.error(f"MicroPrice error: {str(e)}")
             return (best_bid + best_ask) / 2.0 if best_bid and best_ask else 0.0
 
 # Configuration
 BASE_VOL = 0.35
 MIN_LIQUIDITY = st.session_state.MIN_LIQUIDITY
 FUNDING_THRESHOLD = 60
-BATCH_SIZE = 20  # Reduced for mobile performance
+BATCH_SIZE = 10
 
 # Initialize Hyperliquid Client
 @st.cache_resource
@@ -342,11 +334,9 @@ def validate_api_responses():
     try:
         meta_response = api_request_with_retry(info.meta)
         if not meta_response or 'universe' not in meta_response:
-            logging.error("Invalid or empty meta response")
             return False
         all_prices = api_request_with_retry(info.all_mids)
         if not all_prices or not isinstance(all_prices, dict):
-            logging.error("Invalid or empty mids response")
             return False
         return True
     except Exception as e:
@@ -365,41 +355,30 @@ def apply_fallback_for_major_coins():
 async def fetch_all_markets():
     try:
         init_session_state()
-        logging.info("Starting async market fetch")
-        debug_info = st.session_state.debug_info
-
         if not validate_api_responses():
-            st.error("API validation failed.")
+            st.write("API validation failed. Using fallback data.")
             return apply_fallback_for_major_coins()
 
         meta_response = await async_api_request(info.meta)
         meta = MarketUniverse(**meta_response)
-        debug_info['total_markets'] = len(meta.universe)
         if not meta.universe:
-            debug_info['meta_empty'] = 'No markets in universe'
             return apply_fallback_for_major_coins()
 
         all_prices = await async_api_request(info.all_mids)
-        meta_lookup = {coin.name: coin.dict() for coin in meta.universe}
         coins = meta.universe
         total_coins = len(coins)
         batches = [coins[i:i + BATCH_SIZE] for i in range(0, total_coins, BATCH_SIZE)]
-        debug_info['total_batches'] = len(batches)
-        st.session_state.batch_results = []
         market_data = []
         skipped_markets = []
 
         for batch_idx, batch in enumerate(batches):
             batch_data = []
             batch_skipped = []
-            batch_start = batch_idx * BATCH_SIZE + 1
-            batch_end = min((batch_idx + 1) * BATCH_SIZE, total_coins)
-
             progress = st.progress(0)
             status = st.empty()
             status.text(f"Processing batch {batch_idx + 1}/{len(batches)}")
 
-            async def process_coin(coin, idx_in_batch):
+            async def process_coin(coin):
                 symbol = coin.name
                 perp_symbol = f"{symbol}/USDC:USDC"
                 try:
@@ -455,10 +434,10 @@ async def fetch_all_markets():
                         change24h=change_24h,
                     )
                 except Exception as e:
-                    logging.error(f 단계 for {symbol}: {str(e)}")
+                    logging.error(f"Processing failed for {symbol}: {str(e)}")
                     return None
 
-            tasks = [process_coin(coin, i) for i, coin in enumerate(batch)]
+            tasks = [process_coin(coin) for coin in batch]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for result in results:
                 if result is not None:
@@ -469,50 +448,30 @@ async def fetch_all_markets():
             progress.progress(1.0)
             status.empty()
 
-            batch_df = pd.DataFrame([m.dict() for m in batch_data]) if batch_data else pd.DataFrame()
-            st.session_state.batch_results.append({
-                'batch_number': batch_idx + 1,
-                'markets_processed': len(batch_data),
-                'markets_skipped': len(batch_skipped),
-                'data': batch_df
-            })
-
-            st.subheader(f"Batch {batch_idx + 1} Results")
-            if not batch_df.empty:
-                st.dataframe(batch_df, use_container_width=True)
-            else:
-                st.warning(f"No markets met liquidity threshold in batch {batch_idx + 1}")
-
         df = pd.DataFrame([m.dict() for m in market_data])
         if df.empty:
             return apply_fallback_for_major_coins()
-        debug_info['markets_processed'] = len(market_data)
-        debug_info['markets_skipped'] = len(skipped_markets)
-        st.session_state.debug_info = debug_info
         return df.sort_values('volume24h', ascending=False)
 
     except Exception as e:
-        st.error(f"Critical error fetching markets: {str(e)}")
-        logging.error(f"Critical error fetching markets: {str(e)}")
+        st.write(f"Error fetching markets: {str(e)}")
         return apply_fallback_for_major_coins()
 
 # Fetch Candles
-async def fetch_hyperliquid_candles(symbol, interval="1h", limit=50):
+async def fetch_hyperliquid_candles(symbol, interval="1h", limit=24):
     try:
         end_time = int(datetime.now().timestamp() * 1000)
         start_time = end_time - (limit * 60 * 60 * 1000)
         base_symbol = symbol.split('/')[0] if '/' in symbol else symbol
         ohlcv = await async_api_request(info.candles_snapshot, base_symbol, interval, start_time, end_time)
         if not ohlcv or not isinstance(ohlcv, list):
-            logging.warning(f"No candle data for {symbol}")
             return None
         parsed_ohlcv = parse_candles(ohlcv)
         df = pd.DataFrame(parsed_ohlcv, columns=['timestamp', 'time_close', 'symbol', 'interval', 'open', 'close', 'high', 'low', 'volume', 'num'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        st.error(f"Error fetching candles for {symbol}: {str(e)}")
-        logging.error(f"Error fetching candles for {symbol}: {str(e)}")
+        st.write(f"Error fetching candles for {symbol}: {str(e)}")
         return None
 
 # Database Functions
@@ -684,11 +643,11 @@ class ForwardTester:
 # Signal Generation
 async def generate_signals(markets_df):
     if markets_df is None or markets_df.empty:
-        st.warning("No market data for signal generation")
+        st.write("No market data for signal generation")
         return []
     
     signals = []
-    top_markets = markets_df.head(10)  # Reduced for performance
+    top_markets = markets_df.head(5)  # Reduced for iPhone 7
     total_markets = len(top_markets)
     micro_price_calc = MicroPrice(alpha=2.0, volatility_factor=1.0)
     progress_bar = st.progress(0)
@@ -717,7 +676,7 @@ async def generate_signals(markets_df):
             mid_price = (best_bid + best_ask) / 2
             spread = best_ask - best_bid
             spread_bps = (spread / mid_price) * 10000
-            df = await fetch_hyperliquid_candles(symbol, interval='1h', limit=24)  # Reduced limit
+            df = await fetch_hyperliquid_candles(symbol, interval='1h', limit=12)  # Reduced limit
             if df is None or len(df) < 6:
                 return None
             current_price = df['close'].iloc[-1]
@@ -742,12 +701,12 @@ async def generate_signals(markets_df):
             if spread_bps <= max_spread_bps and vol_surge >= 1.5 and vol_consistent:
                 if micro_price_deviation > price_threshold and funding_rate < -FUNDING_THRESHOLD:
                     signal = "LONG"
-                    reason = f"Micro-price above mid: {micro_price_deviation:.4f}, Vol surge {vol_surge:.2f}x"
+                    reason = f"Micro-price deviation: {micro_price_deviation:.4f}, Volume surge: {vol_surge:.2f}x"
                     tp = str(round(current_price * (1 + tp_distance), 4))
                     sl = str(round(current_price * (1 - sl_distance), 4))
                 elif micro_price_deviation < -price_threshold and funding_rate > FUNDING_THRESHOLD:
                     signal = "SHORT"
-                    reason = f"Micro-price below mid: {micro_price_deviation:.4f}, Vol surge {vol_surge:.2f}x"
+                    reason = f"Micro-price deviation: {micro_price_deviation:.4f}, Volume surge: {vol_surge:.2f}x"
                     tp = str(round(current_price * (1 - tp_distance), 4))
                     sl = str(round(current_price * (1 + sl_distance), 4))
             return Signal(
@@ -775,7 +734,6 @@ async def generate_signals(markets_df):
 
     progress_bar.progress(1.0)
     status_text.empty()
-    logging.info(f"Generated {len(signals)} signals")
     return signals
 
 # Scan Markets
@@ -789,9 +747,91 @@ def scan_markets():
             loop = asyncio.get_event_loop()
             markets_df = loop.run_until_complete(fetch_all_markets())
             if markets_df.empty:
-                st.warning("No market data fetched.")
+                st.write("No market data fetched.")
                 return
             st.session_state.scanned_markets = markets_df
-            st.success(f"Found {len(markets_df)} markets.")
+            st.write(f"Found {len(markets_df)} markets.")
     except Exception as e:
-        st.error(f"Error during
+        st.write(f"Error during market scan: {str(e)}")
+        return
+    
+    try:
+        if not markets_df.empty:
+            with st.spinner("Analyzing markets..."):
+                loop = asyncio.get_event_loop()
+                signals = loop.run_until_complete(generate_signals(markets_df))
+                st.session_state.signals = signals
+                actionable_count = len([s for s in signals if s.Signal != 'HOLD'])
+                if actionable_count > 0:
+                    st.write(f"Found {actionable_count} actionable signals.")
+                else:
+                    st.write("No actionable signals found.")
+    except Exception as e:
+        st.write(f"Error during signal generation: {str(e)}")
+        return
+
+# Streamlit UI
+tester = ForwardTester()
+
+with st.sidebar:
+    st.header("Settings")
+    BASE_VOL = st.slider("Volume Threshold", 0.1, 2.0, 0.35, 0.05)
+    liquidity_options = {
+        "1,000 USD": 1000,
+        "5,000 USD": 5000
+    }
+    selected_liquidity = st.selectbox("Minimum Liquidity", options=list(liquidity_options.keys()))
+    MIN_LIQUIDITY = liquidity_options[selected_liquidity]
+    st.session_state.MIN_LIQUIDITY = MIN_LIQUIDITY
+    api_calls_per_second = st.slider("API calls per second", 1.0, 3.0, 2.0, 0.5)
+    rate_limiter.calls_per_second = api_calls_per_second
+
+tab1, tab2, tab3 = st.tabs(["Markets", "Active Trades", "Completed Trades"])
+
+with tab1:
+    st.write(f"Min Liquidity: ${MIN_LIQUIDITY:,} USD")
+    if st.button("Scan Markets"):
+        scan_markets()
+    if not st.session_state.scanned_markets.empty:
+        st.subheader("Markets")
+        display_df = st.session_state.scanned_markets.rename(columns={
+            'symbol': 'Symbol',
+            'markPrice': 'Price',
+            'volume24h': 'Volume (24h)',
+            'fundingRate': 'Funding Rate',
+            'change24h': 'Change (24h)'
+        })
+        st.dataframe(display_df, use_container_width=True)
+    if st.session_state.signals:
+        st.subheader("Signals")
+        signals_df = pd.DataFrame([s.dict() for s in st.session_state.signals])
+        signals_df['Reason'] = signals_df['Reason'].str.replace(r'[<>]', '', regex=True)  # Sanitize output
+        signal_filter = st.multiselect("Filter Signals", ['LONG', 'SHORT', 'HOLD'], ['LONG', 'SHORT'])
+        if signal_filter:
+            filtered_df = signals_df[signals_df['Signal'].isin(signal_filter)]
+            st.dataframe(filtered_df, use_container_width=True)
+            actionable_signals = [s for s in st.session_state.signals if s.Signal != "HOLD" and s.Signal in signal_filter]
+            if actionable_signals and st.button("Execute Signals"):
+                results = tester.execute_trades(actionable_signals)
+                for result in results:
+                    st.write(result)
+
+with tab2:
+    st.header("Active Trades")
+    if st.button("Update Trades"):
+        updates = tester.update_trades()
+        for update in updates:
+            st.write(update)
+    if tester.active_trades:
+        active_df = pd.DataFrame([t.dict() for t in tester.active_trades.values()])
+        st.dataframe(active_df, use_container_width=True)
+    else:
+        st.write("No active trades.")
+
+with tab3:
+    st.header("Completed Trades")
+    stats, completed_df = tester.get_performance_report()
+    if isinstance(completed_df, pd.DataFrame) and len(completed_df) > 0:
+        st.dataframe(completed_df, use_container_width=True)
+    else:
+        st.write("No completed trades.")
