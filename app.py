@@ -890,7 +890,7 @@ async def generate_signals(markets_df):
             vol_consistent = all(v > avg_vol * 0.7 for v in recent_vols)
             df['hlrange'] = df['high'] - df['low']
             avg_range = df['hlrange'].mean()
-            volatility_factor = min(max(avg_range / df['close'].iloc[-1], 0.01), 0.10))
+            volatility_factor = min(max(avg_range / df['close'].iloc[-1], 0.01), 0.10)
             signal = "HOLD"
             reason = ""
             tp = "-"
