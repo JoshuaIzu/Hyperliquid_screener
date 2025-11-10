@@ -153,18 +153,17 @@ class VolumeFetcher:
         self.info = info_client
         self.rate_limiter = RateLimiter(calls_per_second=rate_limit_calls_per_second)
 
-    def get_volume_24h(self, symbol: str, price: float) -> Optional[float]:
+    def get_volume_24h(self, symbol: str) -> Optional[float]:
         try:
             end_time = int(datetime.utcnow().timestamp() * 1000)
             start_time = end_time - (24 * 60 * 60 * 1000)
             candles = self._fetch_candles_snapshot(symbol, "1h", start_time, end_time)
             if candles and isinstance(candles, list) and len(candles) > 0:
-                total_volume = (sum(safe_float(candle.get("v", 0)) for candle in candles))*price
-                
+                total_volume = sum(safe_float(candle.get("v", 0)) for candle in candles)
                 logging.info(f"Volume from candles for {symbol}: ${total_volume:.2f}")
                 return max(total_volume, 10000)
             logging.warning(f"Candlestick data unavailable for {symbol}, falling back to order book")
-            return self._estimate_volume_from_orderbook(symbol, price)
+            return self._estimate_volume_from_orderbook(symbol)
         except Exception as e:
             logging.error(f"Failed to get volume for {symbol}: {str(e)}")
             return 10000
@@ -193,7 +192,7 @@ class VolumeFetcher:
         logging.warning(f"Failed to get candles for {name}. Tried formats: {symbol_formats}. Errors: {errors}")
         return None
 
-    def _estimate_volume_from_orderbook(self, symbol: str, price: str) -> float:
+    def _estimate_volume_from_orderbook(self, symbol: str) -> float:
         self.rate_limiter.wait()
         try:
             book_response = self.info.l2_snapshot(symbol)
@@ -211,7 +210,7 @@ class VolumeFetcher:
             bid_liquidity = sum(level["size"] for level in top_bids)
             ask_liquidity = sum(level["size"] for level in top_asks)
             mid_price = (top_bids[0]["price"] + top_asks[0]["price"]) / 2
-            estimated_volume = (bid_liquidity + ask_liquidity) * price
+            estimated_volume = (bid_liquidity + ask_liquidity) * mid_price
             logging.info(f"Estimated volume from order book for {symbol}: ${estimated_volume:.2f}")
             return max(estimated_volume, 10000)
         except Exception as e:
@@ -234,16 +233,24 @@ class MicroPrice:
         self.volatility_factor = volatility_factor
     
     def calculate(self, best_bid: float, best_ask: float, bid_size: float, ask_size: float) -> float:
+        if not all(isinstance(x, (int, float)) for x in [best_bid, best_ask, bid_size, ask_size]):
+            raise ValueError("All inputs must be numeric")
+        if best_bid < 0 or best_ask < 0 or bid_size < 0 or ask_size < 0:
+            raise ValueError("Inputs must be non-negative")
+        if best_ask < best_bid:
+            best_bid, best_ask = best_ask, best_bid
+        if bid_size == 0 and ask_size == 0:
+            raise ValueError("At least one of bid_size or ask_size must be positive")
         mid_price = (best_bid + best_ask) / 2.0
         if bid_size == 0 or ask_size == 0:
             return mid_price
         spread = best_ask - best_bid
         imbalance = bid_size / (bid_size + ask_size)
-        effective_alpha = self.alpha * self.volatility_factor * 2.0
+        effective_alpha = self.alpha * self.volatility_factor
         delta = imbalance - 0.5
-        adjustment = spread * effective_alpha * delta
+        adjustment = spread * math.tanh(effective_alpha * delta)
         micro_price = mid_price + adjustment
-        return micro_price
+        return max(best_bid, min(best_ask, micro_price))
 
 # ======================== CONFIGURATION ========================
 BASE_VOL = 0.35
@@ -849,6 +856,7 @@ async def generate_signals(markets_df):
     micro_price_calc = MicroPrice(alpha=2.0, volatility_factor=1.0)
     progress_bar = st.progress(0)
     status_text = st.empty()
+    MICRO_PRICE_THRESHOLD = 0.001
 
     async def process_market(index, market):
         symbol = market['symbol']
@@ -890,7 +898,7 @@ async def generate_signals(markets_df):
             vol_consistent = all(v > avg_vol * 0.7 for v in recent_vols)
             df['hlrange'] = df['high'] - df['low']
             avg_range = df['hlrange'].mean()
-            volatility_factor = min(max(avg_range / df['close'].iloc[-1], 0.01), 0.10)
+            volatility_factor = min(max(avg_range / df['close'].iloc[-1], 0.01), 0.05)
             signal = "HOLD"
             reason = ""
             tp = "-"
@@ -900,8 +908,8 @@ async def generate_signals(markets_df):
             micro_price_deviation = (micro_price - mid_price) / mid_price
             price_threshold = max(MICRO_PRICE_THRESHOLD, volatility_factor * 0.5)
             max_spread_bps = 50
-            tp_distance = max(volatility_factor * 8, 0.03)   # Min 3%
-            sl_distance = max(volatility_factor * 4, 0.02)   # Min 2%
+            tp_distance = max(volatility_factor * 5, 0.02)
+            sl_distance = max(volatility_factor * 3, 0.015)
             if spread_bps <= max_spread_bps and vol_surge >= 1.5 and vol_consistent:
                 if micro_price_deviation > price_threshold and funding_rate < -FUNDING_THRESHOLD:
                     signal = "LONG"
